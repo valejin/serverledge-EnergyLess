@@ -195,3 +195,10 @@ const WORKFLOW_SAVE_FUNCTION_INPUT_TO_FILE = "workflow.profiling.saveinput"
 
 const LOAD_BALANCER_POLICY = "loadbalancer.policy"
 const LOAD_BALANCER_TARGET_UPDATE_INTERVAL = "loadbalancer.targets.interval"
+
+// Chiavi per EnergyLess:
+const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_WEIGHT_TIME = "workflow.offloading.policy.energyless.weight.time"
+const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_WEIGHT_ENERGY = "workflow.offloading.policy.energyless.weight.energy"
+const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_WEIGHT_CARBON = "workflow.offloading.policy.energyless.weight.carbon"
+const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_WEIGHT_COST = "workflow.offloading.policy.energyless.weight.cost"
+const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_PLACEMENT_TTL = "workflow.offloading.policy.energyless.placement.ttl"

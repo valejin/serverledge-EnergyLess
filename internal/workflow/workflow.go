@@ -37,6 +37,8 @@ func CreateOffloadingPolicy() {
 		offloadingPolicy = &HEFTlessPolicy{}
 	} else if policyConf == "threshold" {
 		offloadingPolicy = &ThresholdBasedPolicy{}
+	} else if policyConf == "energyless" { // Registrazione policy EnergyLess
+		offloadingPolicy = &EnergyLessPolicy{}
 	} else { // default, disable offloading
 		offloadingPolicy = &NoOffloadingPolicy{}
 	}
@@ -446,7 +448,7 @@ func (wflow *Workflow) Invoke(r *Request) error {
 
 	for len(progress.ReadyToExecute) > 0 {
 		t0 := time.Now()
-		decision, err := offloadingPolicy.Evaluate(r, progress)
+		decision, err := offloadingPolicy.Evaluate(r, progress) // qui chiama l'esecuzione del policy EnergyLess Alg.1
 		policyTime := time.Since(t0).Seconds()
 		r.ExecReport.SchedulingTime += policyTime
 
