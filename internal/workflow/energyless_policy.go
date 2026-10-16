@@ -22,12 +22,40 @@
 //     un nodo Edge NON interroga il Cloud per le risorse residue — si
 //     assume che il Cloud abbia risorse (memoria/CPU) infinite, quindi il
 //     vincolo di capacità è saltato per quel candidato (vedi
-//     estimateOnCandidate). La co2Intensity del cloud, invece, ora viene
+//     estimateOnCandidate). La co2Intensity del cloud, invece, viene
 //     interrogata live (fetchCloudStatus(), stesso pattern HTTP GET
 //     "<APIUrl>/status" di fetchNodeStatus() in
-//     internal/scheduling/co2_qos_policy.go), con fallback alla
-//     CO2Intensity del nodo locale se il cloud non risponde — vedi
+//     internal/scheduling/co2_qos_policy.go — confermato da Cecilia il
+//     16/10 come meccanismo corretto), con fallback sull'ultimo valore
+//     noto del cloud (non più sulla CO2Intensity del nodo locale, decisione
+//     di Valentina del 16/10 dopo che Cecilia ha confermato che il
+//     fallback locale non era una scelta di design validata) — vedi
 //     gatherCandidates().
+//     [NUOVO dal pull del 16/10, commit "fix avg cloud zone retrieval
+//     metrics + add idle power" di Cecilia] È stata aggiunta una potenza
+//     IDLE per nodo/area (consumption.idle.power, config.IDLE_POWER_CONSUMPTION,
+//     node.Resources.IdlePower(), AreaInfo.IdlePowerConsumption,
+//     AreaStat.IdlePowerConsumption, registration.StatusInformation.IdlePowerConsumption
+//     — propagata via heartbeat UDP e via /status esattamente come
+//     ProcessingPowerConsumption), con valori di esempio reali in
+//     examples/carbon/ (800W→300W idle cloud, 100W→40W idle edge). Non
+//     introduce nessuna rottura (solo campi aggiuntivi, non letti da questa
+//     bozza), ma riapre la decisione del 02/10 di ignorare la potenza idle
+//     "in linea col paper originale": ora l'infrastruttura per includerla
+//     nel calcolo dell'energia (Eq. 7) esiste davvero, quindi se si volesse
+//     cambiare quella decisione in futuro i dati sarebbero già disponibili
+//     senza altro lavoro di plumbing. Per ora NON integrata (nessuna azione,
+//     la decisione del 02/10 resta valida finché non viene rivista).
+//     [NUOVO dal pull del 16/10] Fix di Cecilia alla query Prometheus per
+//     le metriche medie del cloud (internal/metrics/retriever.go,
+//     cloudRegionAverageByFunctionQuery/cloudRegionColdStartProbabilityQuery):
+//     la vecchia query divideva _sum/_count senza aggregazione per nodo,
+//     risultato potenzialmente sbagliato con più nodi fisici nella stessa
+//     area cloud; la nuova fa sum by (function, node) prima di dividere, poi
+//     avg by (function). Questo alimenta rm.AvgRemoteExecutionTime, già letto
+//     da estimateExecTime() in questa bozza per il candidato CLOUD — nessuna
+//     modifica di codice necessaria qui, beneficio automatico in termini di
+//     accuratezza della stima del tempo di esecuzione sul cloud.
 //  6. Piano di scheduling in CACHE (non più rivalutazione ad ogni round):
 //     deciso 02/10, come nel paper originale e come già fanno ILP/HEFTless.
 //     Evaluate() ora calcola il placement per l'intera catena di task non
@@ -131,6 +159,24 @@ type EnergyLessPolicy struct {
 	cacheMu      sync.Mutex
 	cache        map[string]*energyLessCacheEntry // chiave: r.Id — valori puntatore come in placementCache (ILP/HEFTless), per poter decrementare ttl in-place
 	cacheTTLInit int                              // numero di letture consentite prima della scadenza (vedi energyLessCacheEntry)
+
+	// cloudCO2Mu/lastKnownCloudCO2/hasLastKnownCloudCO2: fallback per la
+	// query live della CO2Intensity del cloud (vedi gatherCandidates()).
+	// Confermato da Cecilia via mail (16/10) che il fallback "ingenuo" sulla
+	// CO2Intensity del nodo locale, copiato da discoverCloudCandidates() in
+	// internal/scheduling/co2_qos_policy.go, NON è una scelta di design
+	// validata — è semplicemente un aspetto mai sistemato in quel codice.
+	// Qui si usa invece l'ultimo valore live ottenuto con successo dal
+	// cloud, cacheato in memoria per la vita del processo (non per singola
+	// richiesta: è indipendente da cache/cacheTTLInit, che riguardano il
+	// placement, non la CO2). Lock separato da cacheMu perché gatherCandidates()
+	// gira fuori dal lock del placement (vedi Evaluate(): getCachedPlan()
+	// rilascia cacheMu prima di chiamare gatherCandidates()), quindi non c'è
+	// rischio di deadlock riusando lo stesso Mutex, ma un lock dedicato
+	// rende la relazione esplicita e a prova di futuri refactor.
+	cloudCO2Mu           sync.Mutex
+	lastKnownCloudCO2    float64
+	hasLastKnownCloudCO2 bool
 }
 
 func (policy *EnergyLessPolicy) Init() {
@@ -520,24 +566,43 @@ func (policy *EnergyLessPolicy) gatherCandidates() []elCandidate {
 		// riguarda solo la CO2Intensity, non le risorse.
 		//
 		// [RISOLTO punto 5 "Domande ancora aperte"] co2Intensity del cloud:
-		// prima approssimata con la CO2Intensity del nodo locale come
-		// stand-in fisso; ora si tenta una query live allo stesso endpoint
-		// "/status" del load balancer cloud, con lo stesso pattern HTTP già
-		// usato in produzione da discoverCloudCandidates()/fetchNodeStatus()
-		// in internal/scheduling/co2_qos_policy.go (fetchNodeStatus non è
+		// query live allo stesso endpoint "/status" del load balancer
+		// cloud, con lo stesso pattern HTTP già usato in produzione da
+		// discoverCloudCandidates()/fetchNodeStatus() in
+		// internal/scheduling/co2_qos_policy.go (fetchNodeStatus non è
 		// esportata da quel package, quindi qui è reimplementata localmente
 		// in fetchCloudStatus(), stesso endpoint, stesso timeout 3s, stesso
-		// tipo di risposta registration.StatusInformation). Se la query
-		// fallisce (timeout, cloud irraggiungibile, status code non 200,
-		// JSON non decodificabile) si ricade sulla CO2Intensity del nodo
-		// locale come prima — stesso comportamento di fallback "silenzioso"
-		// di discoverCloudCandidates(), che non interrompe mai la pipeline
-		// se il nodo di cui chiede lo stato non risponde.
-		cloudCO2 := node.LocalResources.CO2Intensity() // fallback, come prima
+		// tipo di risposta registration.StatusInformation). Confermato da
+		// Cecilia (16/10): questo pattern è quello corretto, non serve
+		// altro.
+		//
+		// Fallback se la query fallisce (timeout, cloud irraggiungibile,
+		// status code non 200, JSON non decodificabile): si usa l'ULTIMO
+		// valore live ottenuto con successo dal cloud (lastKnownCloudCO2),
+		// non la CO2Intensity del nodo locale — Cecilia ha confermato
+		// (16/10) che quel fallback "ingenuo" copiato da
+		// discoverCloudCandidates() non è una scelta di design validata,
+		// solo un aspetto mai sistemato in quel codice, e ha lasciato la
+		// scelta a questa bozza. Il nodo locale come stand-in resta usato
+		// SOLO al primissimo fallimento, quando non esiste ancora nessun
+		// valore noto del cloud da riusare (caso limite: cloud irraggiungibile
+		// fin dalla primissima richiesta gestita da questo nodo).
+		cloudCO2 := 0.0
 		if status, err := fetchCloudStatus(*cloud); err == nil && status != nil {
 			cloudCO2 = status.CO2Intensity
-		} else if err != nil {
-			log.Printf("energyless: query live CO2Intensity del cloud (%s) fallita, uso CO2Intensity locale come stand-in: %v", cloud.APIUrl(), err)
+			policy.cloudCO2Mu.Lock()
+			policy.lastKnownCloudCO2 = cloudCO2
+			policy.hasLastKnownCloudCO2 = true
+			policy.cloudCO2Mu.Unlock()
+		} else {
+			policy.cloudCO2Mu.Lock()
+			if policy.hasLastKnownCloudCO2 {
+				cloudCO2 = policy.lastKnownCloudCO2
+			} else {
+				cloudCO2 = node.LocalResources.CO2Intensity() // stand-in solo alla primissima query fallita
+			}
+			policy.cloudCO2Mu.Unlock()
+			log.Printf("energyless: query live CO2Intensity del cloud (%s) fallita: %v — uso %v come fallback", cloud.APIUrl(), err, cloudCO2)
 		}
 		c := elCandidate{
 			key:          "CLOUD",
@@ -872,6 +937,41 @@ func maxFloat(a, b float64) float64 {
 //     viaggiano già TaskData/Progress), non nella definizione statica e
 //     condivisa del workflow. Da disegnare e discutere con Cecilia — resta
 //     il gap principale della feature varianti.
+//     [NUOVO, trovato il 16/10 leggendo a fondo internal/scheduling durante
+//     la revisione del pull — non è una modifica di Cecilia in questo pull,
+//     è infrastruttura già esistente che non avevo ancora notato]: un
+//     meccanismo equivalente a "esegui la variante X invece della base"
+//     ESISTE GIÀ, ma a un livello diverso da workflow.OffloadingDecision —
+//     vive in internal/scheduling, lo strato di scheduling della SINGOLA
+//     funzione (non del workflow intero). scheduledRequest ha un campo
+//     executionTarget *function.Function (internal/scheduling/types.go);
+//     execution.go::executionFunction() lo usa al posto di r.Fun se non
+//     nil; è scritto SOLO da Co2QosAwarePolicy (co2_qos_policy.go:357,
+//     "r.executionTarget = execFun") quando quella policy di scheduling
+//     sceglie una variante per una richiesta già arrivata a quello strato.
+//     Il problema per noi: scheduling.SubmitRequest(r *function.Request) è
+//     il punto in cui function_task.go passa la richiesta allo scheduling
+//     (function_task.go:113), e function.Request (internal/function/request.go)
+//     NON ha nessun campo per portare una "variante preferita" scelta a
+//     monte da EnergyLessPolicy — quindi anche se EnergyLessPolicy decide
+//     la variante, oggi non c'è modo di farla arrivare fino a
+//     executionTarget, a meno che lo scheduling.Policy attivo (tipicamente
+//     "localonly" negli esempi examples/carbon/conf*.yaml, che non fa
+//     selezione di varianti) la ridecida da zero per conto suo — duplicando
+//     o contraddicendo la scelta già fatta da EnergyLessPolicy. Proposta
+//     concreta (non ancora implementata, da validare con Cecilia): aggiungere
+//     un campo esportato a function.Request (es. PreferredVariant
+//     *function.Function) che FunctionTask.Execute() imposta prima di
+//     chiamare scheduling.SubmitRequest(r), onorato con una riga in
+//     SubmitRequest() stesso ("if r.PreferredVariant != nil {
+//     schedRequest.executionTarget = r.PreferredVariant }") prima di inviare
+//     la richiesta sul canale requests — bypassando completamente la
+//     necessità che lo scheduling.Policy attivo sappia nulla di varianti.
+//     Resta da capire se EnergyLessPolicy ha, al momento in cui
+//     FunctionTask.Execute() gira, un modo per sapere "per questo task è
+//     stata scelta la variante X" (il placement cachato vive in
+//     policy.cache, non in Request/Progress) — probabilmente lo stesso
+//     meccanismo per-richiesta ipotizzato al punto (a) sopra.
 //  2. Utility della variante (v.Utility): non ancora integrata né come
 //     quinto termine dell'obiettivo né come vincolo di qualità minima —
 //     resta una scelta di modellazione aperta.
@@ -895,28 +995,35 @@ func maxFloat(a, b float64) float64 {
 //     pulizia esplicita. Stesso comportamento del placementCache originale
 //     di ILP/HEFTless (non è un problema introdotto da questa bozza), quindi
 //     non prioritario da risolvere qui per primi.
-//  5. [RISOLTO] co2Intensity del cloud: ora interrogata live in
-//     gatherCandidates() tramite fetchCloudStatus(), che reimplementa
-//     localmente (non esportata da scheduling) lo stesso pattern HTTP già
-//     usato in produzione da fetchNodeStatus()/discoverCloudCandidates() in
+//  5. [RISOLTO, confermato da Cecilia via mail il 16/10] co2Intensity del
+//     cloud: interrogata live in gatherCandidates() tramite
+//     fetchCloudStatus(), che reimplementa localmente (non esportata da
+//     scheduling) lo stesso pattern HTTP già usato in produzione da
+//     fetchNodeStatus()/discoverCloudCandidates() in
 //     internal/scheduling/co2_qos_policy.go: GET a
 //     "<APIUrl del load balancer dell'area>/status", risposta decodificata
 //     in registration.StatusInformation (campo CO2Intensity, reale e live).
-//     Se la query fallisce (timeout 3s, cloud irraggiungibile, status code
-//     non 200, JSON non valido) si ricade sulla CO2Intensity del nodo
-//     locale come prima — stesso comportamento di fallback "silenzioso" di
-//     discoverCloudCandidates(), che non interrompe mai la pipeline se il
-//     nodo interrogato non risponde. Resta un round-trip HTTP in più dentro
-//     Evaluate()/buildPlan(), ma non nel percorso critico ad ogni round:
-//     gatherCandidates() è chiamata solo quando il piano NON è già in cache
-//     (punto 6 in testa al file, TTL effettivamente permanente), quindi al
-//     più una volta per richiesta, non ad ogni round come in
-//     Co2QosAwarePolicy. Se Cecilia/Cardellini preferissero evitare anche
-//     questo singolo round-trip, si torna al solo fallback locale
-//     commentando la chiamata a fetchCloudStatus() in gatherCandidates().
-//     Non toccati invece procPowerW/txEnergyJPerByte/rxEnergyJPerByte del
-//     candidato cloud, che restano letti da policy.regionsCfg come prima
-//     (fuori scope di questa modifica, che riguardava solo la CO2).
+//     Cecilia ha confermato che questo è esattamente il meccanismo corretto
+//     (già presente come struct AreaStat in regions/types.go e già usato
+//     da discoverCloudCandidates), quindi non c'è altro da costruire.
+//     Fallback se la query fallisce (timeout 3s, cloud irraggiungibile,
+//     status code non 200, JSON non valido): NON più la CO2Intensity del
+//     nodo locale come in discoverCloudCandidates() — Cecilia ha chiarito
+//     che quel fallback "silenzioso" non è una scelta di design validata,
+//     solo un aspetto mai sistemato in quel codice, lasciando la scelta a
+//     questa bozza. Si usa invece l'ULTIMO valore live ottenuto con
+//     successo dal cloud (policy.lastKnownCloudCO2, con policy.cloudCO2Mu a
+//     protezione), più accurato di un valore preso da un nodo diverso; il
+//     nodo locale resta come stand-in SOLO alla primissima query fallita,
+//     quando ancora non esiste nessun valore noto da riusare. Resta un
+//     round-trip HTTP in più dentro Evaluate()/buildPlan(), ma non nel
+//     percorso critico ad ogni round: gatherCandidates() è chiamata solo
+//     quando il piano NON è già in cache (punto 6 in testa al file, TTL
+//     effettivamente permanente), quindi al più una volta per richiesta,
+//     non ad ogni round come in Co2QosAwarePolicy. Non toccati invece
+//     procPowerW/txEnergyJPerByte/rxEnergyJPerByte del candidato cloud, che
+//     restano letti da policy.regionsCfg come prima (fuori scope di questa
+//     modifica, che riguardava solo la CO2).
 //  6. [AGGIORNATO] cacheSolution/getCachedPlan ora replicano fedelmente la
 //     logica reale di ILP/HEFTless (verificata sul file
 //     remote_offloading_policy.go, non più un'ipotesi) ma restano una copia
