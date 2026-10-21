@@ -205,3 +205,14 @@ const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_WEIGHT_ENERGY = "workflow.offloading
 const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_WEIGHT_CARBON = "workflow.offloading.policy.energyless.weight.carbon"
 const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_WEIGHT_COST = "workflow.offloading.policy.energyless.weight.cost"
 const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_PLACEMENT_TTL = "workflow.offloading.policy.energyless.placement.ttl"
+
+// Costo di trasferimento dati verso il data store per l'offloading
+// EnergyLess (CT^f, Eq. 14 del paper) — costo per byte trasferito.
+// Default 0.0 se non impostata: nessun costo di trasferimento aggiuntivo.
+const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_NODE_TO_DATA_STORE_TRANSFER_COST = "workflow.offloading.policy.energyless.node2datastore.transfer.cost"
+const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CLOUD_TO_DATA_STORE_TRANSFER_COST = "workflow.offloading.policy.energyless.cloud2datastore.transfer.cost"
+
+// Costo di storage dei dati prodotti per l'offloading EnergyLess (CS^f,
+// Eq. 15 del paper) — costo per byte salvato. Default 0.0 se non impostata.
+const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_NODE_TO_DATA_STORE_STORAGE_COST = "workflow.offloading.policy.energyless.node2datastore.storage.cost"
+const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CLOUD_TO_DATA_STORE_STORAGE_COST = "workflow.offloading.policy.energyless.cloud2datastore.storage.cost"

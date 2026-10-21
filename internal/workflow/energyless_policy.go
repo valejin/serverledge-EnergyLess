@@ -27,10 +27,7 @@
 //     "<APIUrl>/status" di fetchNodeStatus() in
 //     internal/scheduling/co2_qos_policy.go — confermato da Cecilia il
 //     16/10 come meccanismo corretto), con fallback sull'ultimo valore
-//     noto del cloud (non più sulla CO2Intensity del nodo locale, decisione
-//     di Valentina del 16/10 dopo che Cecilia ha confermato che il
-//     fallback locale non era una scelta di design validata) — vedi
-//     gatherCandidates().
+//     noto del cloud — vedi gatherCandidates().
 //     [NUOVO dal pull del 16/10, commit "fix avg cloud zone retrieval
 //     metrics + add idle power" di Cecilia] È stata aggiunta una potenza
 //     IDLE per nodo/area (consumption.idle.power, config.IDLE_POWER_CONSUMPTION,
@@ -38,14 +35,15 @@
 //     AreaStat.IdlePowerConsumption, registration.StatusInformation.IdlePowerConsumption
 //     — propagata via heartbeat UDP e via /status esattamente come
 //     ProcessingPowerConsumption), con valori di esempio reali in
-//     examples/carbon/ (800W→300W idle cloud, 100W→40W idle edge). Non
-//     introduce nessuna rottura (solo campi aggiuntivi, non letti da questa
-//     bozza), ma riapre la decisione del 02/10 di ignorare la potenza idle
-//     "in linea col paper originale": ora l'infrastruttura per includerla
-//     nel calcolo dell'energia (Eq. 7) esiste davvero, quindi se si volesse
-//     cambiare quella decisione in futuro i dati sarebbero già disponibili
-//     senza altro lavoro di plumbing. Per ora NON integrata (nessuna azione,
-//     la decisione del 02/10 resta valida finché non viene rivista).
+//     examples/carbon/ (800W→300W idle cloud, 100W→40W idle edge).
+//     [DECISIONE RIVISTA il 17/10] La potenza idle è ora
+//     REINTEGRATA nell'Eq. 7 (vedi elCandidate.idlePowerW e energyJoules) —
+//     la decisione del 02/10 di ignorarla "in linea col paper originale"
+//     viene quindi superata da questa modifica. ATTENZIONE: è una scelta
+//     presa qui, non ancora confermata con Cardellini/Cecilia/Russo Russo
+//     nello stesso modo delle altre decisioni di questo file — da
+//     menzionare esplicitamente al prossimo ricevimento, non darla per
+//     acquisita come le altre voci "deciso 02/10".
 //     [NUOVO dal pull del 16/10] Fix di Cecilia alla query Prometheus per
 //     le metriche medie del cloud (internal/metrics/retriever.go,
 //     cloudRegionAverageByFunctionQuery/cloudRegionColdStartProbabilityQuery):
@@ -62,7 +60,7 @@
 //     ancora eseguiti UNA SOLA VOLTA (buildPlan), lo cachea per richiesta
 //     (cacheSolution/getCachedPlan, chiave r.Id). Verificato sul codice reale
 //     di ILP/HEFTless (remote_offloading_policy.go): la cache NON scade per
-//     tempo reale (come assunto in una versione precedente di questo file),
+//     tempo reale,
 //     ma per numero di LETTURE residue (ttl int, decrementato a ogni round
 //     che riusa il piano) — replicato identicamente qui. Nei round
 //     successivi il piano cachato viene tradotto in decisione senza
@@ -92,6 +90,74 @@
 //     workflow. Implementato in computeDecisionFromPlacement(): toExecute
 //     è costruito iterando sull'intero placement cachato (filtrato per
 //     chosenRemote), non più solo su p.ReadyToExecute.
+//  12. [BUG RISOLTO, trovato il 17/10 confrontando il codice
+//     col paper] buildPlan() usciva con un placement VUOTO al primo round:
+//     InitProgress() (progress.go) mette in ReadyToExecute, al round 1,
+//     solo workflow.Start.Id — uno *StartTask, non un *FunctionTask. Il
+//     filtro "non è un FunctionTask → continue" scartava questo task SENZA
+//     accodare il suo successore, la coda si vuotava subito, e il
+//     placement vuoto veniva cachato con TTL ~9999 — la policy non
+//     offloadava mai più per tutta la vita della richiesta. Corretto in
+//     buildPlan(): i task non-FunctionTask che implementano comunque
+//     UnaryTask (StartTask, PassTask, FailureTask: hanno un GetNext()
+//     deterministico) vengono ora attraversati senza fare placement; la
+//     catena si interrompe davvero solo per un ConditionalTask (ChoiceTask,
+//     il cui next dipende da dati a runtime) o per un task senza
+//     successore (EndTask).
+//  13. [BUG RISOLTO, trovato il 17/10
+//     — scadenza non cumulativa] residualDeadline viene calcolata UNA VOLTA
+//     sola in Evaluate() (QoS.MaxRespT meno il tempo già trascorso
+//     dall'arrivo della richiesta) e prima di questa correzione veniva
+//     passata INVARIATA a selectBest()/estimateOnCandidate() per OGNI task
+//     della catena costruita da buildPlan() — cioè ogni task, anche il
+//     decimo di una catena lunga, veniva confrontato con l'intera finestra
+//     residua come se fosse l'unico task rimasto da eseguire (Eq. 5 del
+//     paper applicata senza la somma cumulativa di Eq. 4). Risultato: un
+//     piano con più task in sequenza, ciascuno singolarmente entro
+//     deadline, poteva comunque sforare la deadline complessiva della
+//     richiesta nel suo insieme, perché buildPlan non teneva conto del
+//     tempo già "impegnato" dai task precedenti nella stessa catena.
+//     Corretto in buildPlan(): un accumulatore elapsedChain somma il
+//     completionTime (Eq. 2-4) di ogni task via via posizionato nella
+//     catena corrente; il task successivo riceve come budget
+//     "residualDeadline - elapsedChain" invece della residualDeadline
+//     originale invariata. Se il budget residuo scende a zero o sotto
+//     zero, selectBest() non trova più candidati fattibili (stesso
+//     comportamento di un vincolo di deadline violato) e il task resta
+//     fuori dal placement, come già accadeva per qualunque altro task
+//     infattibile — nessuna modifica a selectBest()/estimateOnCandidate(),
+//     solo al valore che buildPlan() passa loro.
+//  14. [AGGIORNATO 17/10 — costo/CO2 incompleti
+//     rispetto a Eq. 10/14/15] estimateOnCandidate() mancava di quattro
+//     termini del modello EnergyLess, rendendo le stime sui candidati
+//     remoti sistematicamente più ottimistiche di quanto previsto dal
+//     paper:
+//     - Cold start (λ_i^f, Eq. 2): ora incluso nel completionTime,
+//     stimato come tempo medio di init osservato * probabilità di cold
+//     start (nuova estimateInitTime(), stesso approccio già usato da
+//     ILP/HEFTless in prepareParameters() per lo stesso scopo).
+//     - Vincolo di banda (Eq. 20): prima, un candidato per cui la banda
+//     verso il data store non era configurata veniva trattato come "a
+//     tempo di trasferimento zero" (ottimistico e sbagliato); ora un
+//     simile candidato è semplicemente infattibile.
+//     - Costo di trasferimento (CT^f, Eq. 14) e di storage (CS^f, Eq. 15):
+//     aggiunti al costo totale per i candidati non locali, con due coppie
+//     di chiavi di configurazione NUOVE, promosse in
+//     internal/config/keys.go (WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_
+//     NODE/CLOUD_TO_DATA_STORE_TRANSFER/STORAGE_COST, vedi commento sopra
+//     dataStoreTransferCostPerByte/dataStoreStorageCostPerByte), default
+//     0.0 — nessun cambio di comportamento finché non vengono impostate
+//     esplicitamente.
+//     NON risolto (limite dell'infrastruttura, non di questa bozza): la
+//     componente "storage" di Eq. 10 (CO^f_data = ξ_j · E^f_data, dove ξ_j è
+//     l'intensità di carbonio dello STORAGE, distinta da quella del
+//     candidato di calcolo ξ_i) resta approssimata con ξ_i, perché
+//     Serverledge non espone da nessuna parte una CO2Intensity per lo
+//     storage — solo per i nodi di calcolo (registration.StatusInformation).
+//     Vedi "Domande ancora aperte" in fondo al file: servirebbe prima che
+//     Serverledge modellasse una posizione/intensità di carbonio per il
+//     data store, non è qualcosa che si possa sistemare solo in questo
+//     file.
 package workflow
 
 import (
@@ -115,12 +181,11 @@ import (
 )
 
 // ---------------------------------------------------------------------
-// [CONFERMATO sul vero internal/config/keys.go, letto nello zip del
-// progetto]: le 5 chiavi WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_* (weight.
-// time/.energy/.carbon/.cost + placement.ttl) sono già presenti, non più da
-// aggiungere. Confermata anche la registrazione della policy in
-// workflow.go::CreateOffloadingPolicy() (branch "energyless") — vedi anche
-// il blocco in fondo al file, ora aggiornato di conseguenza.
+// [AGGIUNTO sul vero internal/config/keys.go]: le 5 chiavi
+// WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_* (weight.time/.energy/.carbon/.cost
+// + placement.ttl) sono già presenti, non più da
+// aggiungere. Aggiunto anche la registrazione della policy in
+// workflow.go::CreateOffloadingPolicy().
 //
 // Non serve nient'altro: costo, banda e CO2 riusano chiavi già esistenti
 // (region.cost, node2datastore.bandwidth, cloud2datastore.bandwidth,
@@ -136,10 +201,9 @@ type energyLessWeights struct {
 
 // energyLessCacheEntry è il piano cachato per una singola richiesta: il
 // placement calcolato una sola volta da buildPlan() per tutta la catena di
-// task non ancora eseguiti, più un contatore di letture residue. Verificato
-// sul codice reale (cachedPlacement in remote_offloading_policy.go, usata da
-// ILP/HEFTless): il "ttl" NON è una durata in tempo reale (come avevo
-// assunto prima di vedere il file), ma un contatore di quante volte ancora
+// task non ancora eseguiti, più un contatore di letture residue.
+// (cachedPlacement in remote_offloading_policy.go, usata da ILP/HEFTless):
+// il "ttl" NON è una durata in tempo reale, ma un contatore di quante volte ancora
 // la entry può essere letta da getCachedSolution() prima di scadere — si
 // decrementa di 1 a ogni lettura riuscita ed è rimosso quando arriva a 0.
 // Qui replicato con lo stesso comportamento (vedi getCachedPlan).
@@ -162,10 +226,6 @@ type EnergyLessPolicy struct {
 
 	// cloudCO2Mu/lastKnownCloudCO2/hasLastKnownCloudCO2: fallback per la
 	// query live della CO2Intensity del cloud (vedi gatherCandidates()).
-	// Confermato da Cecilia via mail (16/10) che il fallback "ingenuo" sulla
-	// CO2Intensity del nodo locale, copiato da discoverCloudCandidates() in
-	// internal/scheduling/co2_qos_policy.go, NON è una scelta di design
-	// validata — è semplicemente un aspetto mai sistemato in quel codice.
 	// Qui si usa invece l'ultimo valore live ottenuto con successo dal
 	// cloud, cacheato in memoria per la vita del processo (non per singola
 	// richiesta: è indipendente da cache/cacheTTLInit, che riguardano il
@@ -198,12 +258,10 @@ func (policy *EnergyLessPolicy) Init() {
 
 	policy.cache = make(map[string]*energyLessCacheEntry)
 	// NOTA: come in ILP/HEFTless, "ttl" è un numero di LETTURE residue (si
-	// decrementa a ogni round che riusa il piano in cache), non una durata
-	// in secondi — vedi commento su energyLessCacheEntry.
+	// decrementa a ogni round che riusa il piano in cache).
 	//
-	// [CORRETTO dopo lettura di ilp_offloading_policy.go/heftless_policy.go
-	// reali]: config.GetInt() esiste davvero (non serve più il cast da
-	// GetFloat), usata qui direttamente. Anche il DEFAULT è stato corretto:
+	// [CORRETTO dopo lettura di ilp_offloading_policy.go/heftless_policy.go]:
+	// config.GetInt() esiste, usata qui direttamente. Anche il DEFAULT è stato corretto:
 	// il valore reale passato a cacheSolution() è
 	//   - ILP:      config.GetInt(WORKFLOW_OFFLOADING_POLICY_ILP_PLACEMENT_TTL, 2) - 1
 	//     cioè default effettivo 1 lettura: ILP ricalcola il piano quasi a
@@ -214,10 +272,7 @@ func (policy *EnergyLessPolicy) Init() {
 	// EnergyLess, per decisione del 02/10, deve comportarsi come HEFTless su
 	// questo punto (piano calcolato una sola volta, "la rivalutazione
 	// dinamica del piano resta rimandata", niente re-scheduling a metà
-	// esecuzione — vedi punto 6 in testa al file): il default qui va quindi
-	// allineato a quello di HEFTless (9999), non a quello di ILP. Il default
-	// precedente (5) era arbitrario e avrebbe forzato un ricalcolo indesiderato
-	// a metà di richieste con più di 5 round.
+	// esecuzione): il default qui va quindi allineato a quello di HEFTless (9999).
 	policy.cacheTTLInit = config.GetInt(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_PLACEMENT_TTL, 9999)
 }
 
@@ -230,9 +285,10 @@ type elCandidate struct {
 	isLocal          bool
 	area             string
 	availMemMB       float64 // non usato per il candidato CLOUD, vedi estimateOnCandidate
-	availCPU         float64 // idem — per CLOUD si assume capacità infinita (deciso 02/10)
+	availCPU         float64 // per CLOUD si assume capacità infinita. Corrisponde a soglia di concorrenza nel paper
 	co2Intensity     float64 // gCO2eq/kWh — ξ_i nel paper
-	procPowerW       float64 // W — τ_i nel paper (potenza sotto carico, non distingue idle: deciso 02/10 di ignorare il termine idle, come nel paper)
+	procPowerW       float64 // W — τ_i nel paper (potenza sotto carico, esecuzione)
+	idlePowerW       float64 // W — ε_i nel paper (potenza a riposo, nodo attivo ma senza task in esecuzione).
 	txEnergyJPerByte float64 // J/byte — energia NIC in trasmissione
 	rxEnergyJPerByte float64 // J/byte — energia NIC in ricezione
 }
@@ -244,9 +300,9 @@ type elEstimate struct {
 	candidate      elCandidate
 	functionName   string        // nome della funzione o VARIANTE effettivamente valutata (punto 1)
 	completionTime time.Duration // TT^f, Eq. 2-4
-	energyJoules   float64       // E^f, Eq. 7 (senza componente idle, deciso 02/10)
-	carbonGrams    float64       // CO^f, Eq. 10
-	cost           float64       // Z^f, Eq. 13
+	energyJoules   float64       // E^f, Eq. 7 (include ε_i idle dal 17/10, vedi energyJoules())
+	carbonGrams    float64       // CO^f, Eq. 10 (limite noto sul termine storage ξ_j — vedi estimateOnCandidate)
+	cost           float64       // Z^f = CC^f + CT^f + CS^f, Eq. 13+14+15
 	objective      float64       // somma pesata normalizzata, Eq. 22
 }
 
@@ -298,6 +354,13 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 	// rivedere quando FanOut sarà disponibile.
 	queue := policy.rankReadyTasks(r, p, candidates)
 
+	// elapsedChain accumula il completionTime (Eq. 2-4) dei task già
+	// posizionati in QUESTA chiamata di buildPlan, camminando la catena.
+	// Serve a calcolare, per il prossimo task, la deadline RESIDUA corretta
+	// ("residualDeadline - elapsedChain") invece di passare sempre la
+	// stessa residualDeadline calcolata una sola volta in Evaluate().
+	elapsedChain := 0.0
+
 	for len(queue) > 0 {
 		tid := queue[0]
 		queue = queue[1:]
@@ -305,12 +368,31 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 			continue
 		}
 
-		// Filtra solo i FunctionTask
-		ft, isFunc := r.W.Tasks[tid].(*FunctionTask)
+		task := r.W.Tasks[tid]
+
+		// Filtra solo i FunctionTask per il placement:
+		// InitProgress() mette SEMPRE in ReadyToExecute, al round 1, solo
+		// lo StartTask (workflow.Start.Id) — che non è un *FunctionTask.
+		// Il codice precedente faceva "continue" su questo mismatch SENZA
+		// accodare il successore, quindi la coda si vuotava subito, il
+		// placement usciva vuoto, e quell'empty map veniva cachata con TTL
+		// 9999 (quasi permanente) — la policy non offloadava mai più per
+		// l'intera vita della richiesta. StartTask/PassTask/FailureTask
+		// (oltre a FunctionTask) implementano tutti UnaryTask (hanno un
+		// GetNext() deterministico, verificato su start_task.go/
+		// pass_task.go/fail_task.go/function_task.go): per questi si segue
+		// GetNext() senza fare placement (non eseguono codice utente, non
+		// c'è nessuna decisione da prendere). Ci si ferma DAVVERO solo per
+		// un ConditionalTask (ChoiceTask: il prossimo task dipende da dati
+		// a runtime, non calcolabile staticamente qui) o per un task senza
+		// alcun successore (EndTask e simili).
+		ft, isFunc := task.(*FunctionTask)
 		if !isFunc {
-			// Task non-funzione (Choice, Pass, ecc.): fine della catena
-			// lineare a partire da qui — nessuna decisione di placement
-			// da prendere, Serverledge lo eseguirà localmente.
+			if ut, isUnary := task.(UnaryTask); isUnary {
+				if next := ut.GetNext(); next != "" {
+					queue = append(queue, next)
+				}
+			}
 			continue
 		}
 		f, found := function.GetFunction(ft.Func)
@@ -318,12 +400,21 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 			continue
 		}
 
+		// Budget residuo per QUESTO task (punto 13 in testa al file): la
+		// deadline complessiva della richiesta meno quanto già "consumato"
+		// dai task precedenti nella stessa catena (elapsedChain).
+		remainingDeadline := residualDeadline
+		if !math.IsInf(residualDeadline, 1) {
+			remainingDeadline = residualDeadline - elapsedChain
+		}
+
 		// Chiama selectBest() (righe 16-23 dell'Alg. 1, esteso con le
 		// varianti — punto 1) per trovare la coppia migliore per questo
-		// task. Se nessuna è fattibile (capacità o deadline), logga e
-		// passa al prossimo task della coda — non abortisce l'intero piano
-		// per un solo task problematico.
-		best, err := policy.selectBest(f, candidates, residualDeadline)
+		// task. Se nessuna è fattibile (capacità o deadline residua, ora
+		// correttamente al netto della catena già percorsa), logga e passa
+		// al prossimo task della coda — non abortisce l'intero piano per un
+		// solo task problematico.
+		best, err := policy.selectBest(f, candidates, remainingDeadline)
 		if err != nil {
 			log.Printf("EnergyLess: nessuna coppia fattibile per %s (task %s): %v", ft.Func, tid, err)
 			continue
@@ -335,6 +426,7 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 			log.Printf("EnergyLess: per il task %s scelta la variante %s al posto di %s", tid, best.functionName, f.Name)
 		}
 		placement[tid] = best
+		elapsedChain += best.completionTime.Seconds()
 
 		if ft.NextTask != "" {
 			queue = append(queue, ft.NextTask)
@@ -373,16 +465,9 @@ func (policy *EnergyLessPolicy) computeDecisionFromPlacement(p *Progress, placem
 		}
 
 		// Se invece il candidato migliore è remoto: chosenRemote viene aggiornato a OGNI task
-		// pronto remoto incontrato (non solo al primo). Verificato sul codice reale di
-		// computeDecisionFromPlacement in remote_offloading_policy.go (ILP/HEFTless):
-		//   for _, t := range p.ReadyToExecute {
-		//       assignedNode := placement[t]
-		//       if assignedNode == registration.SelfRegistration.Key { localExecution = true; break }
-		//       else { remoteNode = assignedNode }
-		//   }
+		// pronto remoto incontrato (non solo al primo).
 		// cioè se p.ReadyToExecute contiene più task pronti assegnati a nodi remoti diversi, vince
-		// l'ULTIMO incontrato nell'ordine dello slice, non il primo — replicato qui identicamente
-		// per restare fedeli al comportamento originale (anche se non è l'unica scelta sensata).
+		// l'ULTIMO incontrato nell'ordine dello slice, non il primo).
 		c := est.candidate
 		chosenRemote = &c
 	}
@@ -426,11 +511,8 @@ func (policy *EnergyLessPolicy) computeDecisionFromPlacement(p *Progress, placem
 }
 
 // cacheSolution e getCachedPlan implementano la cache del piano per
-// richiesta (punto 6). Non più una reimplementazione "a modello" come nella
-// versione precedente di questo file: ora che ho il codice reale di
-// cacheSolution/getCachedSolution in remote_offloading_policy.go (ILP/
-// HEFTless), questa è una copia fedele della stessa logica — valori
-// puntatore nella mappa (come placementCache) e ttl come contatore di
+// richiesta (punto 6).
+// Il puntatore nella mappa (come placementCache) e ttl come contatore di
 // letture, non come scadenza temporale (vedi energyLessCacheEntry). Resta
 // una copia locale, non una funzione condivisa: il value type della mappa è
 // diverso (map[TaskId]*elEstimate qui, taskPlacement=map[TaskId]string
@@ -527,6 +609,7 @@ func (policy *EnergyLessPolicy) gatherCandidates() []elCandidate {
 			availCPU:         node.LocalResources.AvailableCPUs(),
 			co2Intensity:     node.LocalResources.CO2Intensity(),
 			procPowerW:       node.LocalResources.ProcessingPower(),
+			idlePowerW:       node.LocalResources.IdlePower(),
 			txEnergyJPerByte: node.LocalResources.TxEnergyPerByte(),
 			rxEnergyJPerByte: node.LocalResources.RxEnergyPerByte(),
 		})
@@ -552,6 +635,7 @@ func (policy *EnergyLessPolicy) gatherCandidates() []elCandidate {
 			availCPU:         status.TotalCPU - status.UsedCPU,
 			co2Intensity:     status.CO2Intensity,
 			procPowerW:       status.ProcessingPowerConsumption,
+			idlePowerW:       status.IdlePowerConsumption,
 			txEnergyJPerByte: status.TxEnergyConsumption,
 			rxEnergyJPerByte: status.RxEnergyConsumption,
 		})
@@ -572,18 +656,12 @@ func (policy *EnergyLessPolicy) gatherCandidates() []elCandidate {
 		// internal/scheduling/co2_qos_policy.go (fetchNodeStatus non è
 		// esportata da quel package, quindi qui è reimplementata localmente
 		// in fetchCloudStatus(), stesso endpoint, stesso timeout 3s, stesso
-		// tipo di risposta registration.StatusInformation). Confermato da
-		// Cecilia (16/10): questo pattern è quello corretto, non serve
-		// altro.
+		// tipo di risposta registration.StatusInformation).
 		//
 		// Fallback se la query fallisce (timeout, cloud irraggiungibile,
 		// status code non 200, JSON non decodificabile): si usa l'ULTIMO
-		// valore live ottenuto con successo dal cloud (lastKnownCloudCO2),
-		// non la CO2Intensity del nodo locale — Cecilia ha confermato
-		// (16/10) che quel fallback "ingenuo" copiato da
-		// discoverCloudCandidates() non è una scelta di design validata,
-		// solo un aspetto mai sistemato in quel codice, e ha lasciato la
-		// scelta a questa bozza. Il nodo locale come stand-in resta usato
+		// valore live ottenuto con successo dal cloud (lastKnownCloudCO2).
+		// Il nodo locale come stand-in resta usato
 		// SOLO al primissimo fallimento, quando non esiste ancora nessun
 		// valore noto del cloud da riusare (caso limite: cloud irraggiungibile
 		// fin dalla primissima richiesta gestita da questo nodo).
@@ -613,6 +691,7 @@ func (policy *EnergyLessPolicy) gatherCandidates() []elCandidate {
 		if policy.regionsCfg != nil {
 			if info, ok := policy.regionsCfg.Area(cloud.Area); ok {
 				c.procPowerW = info.ProcessingPowerConsumption
+				c.idlePowerW = info.IdlePowerConsumption
 				c.txEnergyJPerByte = info.TxEnergyConsumption
 				c.rxEnergyJPerByte = info.RxEnergyConsumption
 			}
@@ -625,13 +704,11 @@ func (policy *EnergyLessPolicy) gatherCandidates() []elCandidate {
 
 // fetchCloudStatus interroga lo stato live del load balancer del target
 // cloud configurato (registration.GetRemoteOffloadingTarget()), per
-// ottenere una CO2Intensity reale e aggiornata invece di approssimarla con
-// quella del nodo locale. Replica localmente, identico, il pattern HTTP già
+// ottenere una CO2Intensity reale e aggiornata.
+// Replica localmente, identico, il pattern HTTP già
 // usato in produzione da fetchNodeStatus()/discoverCloudCandidates() in
 // internal/scheduling/co2_qos_policy.go (non riusabile direttamente: è una
-// funzione privata di quel package) — stesso endpoint "<APIUrl>/status",
-// stesso timeout di 3s, stessa risposta decodificata in
-// registration.StatusInformation (tipo esportato).
+// funzione privata di quel package).
 func fetchCloudStatus(lb registration.NodeRegistration) (*registration.StatusInformation, error) {
 	client := http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(lb.APIUrl() + "/status")
@@ -653,19 +730,13 @@ func fetchCloudStatus(lb registration.NodeRegistration) (*registration.StatusInf
 // superano ValidateVariantMetadata(). f stessa non deve essere già una
 // variante (si valutano varianti solo a partire dalla funzione base).
 //
-// Verificato sul vero internal/function/function.go condiviso da Valentina
-// (package function):
 //   - GetVariantsOf(baseName string) ([]*Function, error): ritorna solo le
 //     funzioni già filtrate con IsVariant() && DefaultFunction == baseName
 //     (vedi filterVariants), ordinate per nome — da qui la necessità di
 //     gestire anche l'errore, non solo il value, come corretto sotto.
-//   - ValidateVariantMetadata() esiste davvero come metodo su *Function
+//   - ValidateVariantMetadata() esiste come metodo su *Function
 //     (controlla: non-default con DefaultFunction vuoto, nome diverso dal
-//     default, SpeedUp > 0, Utility in [0,1]) — il precedente "Unresolved
-//     reference" segnalato da Valentina non dipendeva quindi da un'API
-//     inesistente, ma da una versione di function.go non ancora aggiornata
-//     nel suo IDE/branch locale rispetto a questo file. Richiamata di
-//     nuovo qui come in origine.
+//     default, SpeedUp > 0, Utility in [0,1]).
 func validVariants(f *function.Function) []*function.Function {
 	if f.IsVariant() {
 		return nil
@@ -765,6 +836,14 @@ func (policy *EnergyLessPolicy) selectBest(f *function.Function, candidates []el
 // base, baseExecTime/SpeedUp per una variante (vedi selectBest).
 // Ritorna anche execTime (utile al chiamante per calcolare il fallback
 // delle varianti) e ok=false se il candidato non è fattibile.
+//
+// [AGGIORNATO 17/10, punto 14 in testa al file] Prima di questa modifica
+// mancavano, rispetto ad Alg. 2/Eq. 2/10/14/15 del paper: il cold start
+// (λ_i^f) nel tempo di completamento, il costo di trasferimento (CT^f,
+// Eq. 14) e di storage (CS^f, Eq. 15) nel costo, e un vero vincolo di banda
+// (Eq. 20) — una banda non configurata per un candidato veniva trattata
+// come "trasferimento istantaneo" invece che come candidato infattibile.
+// Tutti e quattro aggiunti qui.
 func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics, c elCandidate, fn *function.Function, metricName string, residualDeadline float64, fallbackExecTime float64) (execTime float64, est *elEstimate, ok bool) {
 	// Vincolo di capacità (Eq. 18-19 / ρ_i, Eq. 21 — chiarito 02/10 che ρ_i
 	// corrisponde ad available CPU, già controllato qui): per il candidato
@@ -784,17 +863,64 @@ func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics,
 		execTime = 0.01
 	}
 
-	completion := time.Duration(execTime * float64(time.Second))
+	// Cold start (λ_i^f, Eq. 2): tempo di init ATTESO, già pesato per la
+	// probabilità di cold start osservata — vedi estimateInitTime(). Prima
+	// di questa modifica il piano ignorava del tutto questo termine,
+	// sottostimando sistematicamente il completionTime di ogni candidato
+	// (di più per i remoti, dove un container caldo è meno probabile che in
+	// locale).
+	initTime := estimateInitTime(rm, c, metricName)
+	completion := time.Duration((execTime + initTime) * float64(time.Second))
+
+	var transferCost, storageCost float64
 	if !c.isLocal {
-		completion += transferTime(c, fn)
+		// Vincolo di banda (Eq. 20): se per questo TIPO di candidato
+		// (edge/nodo vs cloud) non è configurata una banda verso il data
+		// store, il candidato non è fattibile — non si tratta più un
+		// collegamento non configurato come "a tempo zero" (comportamento
+		// della precedente transferTime(), che favoriva artificialmente un
+		// candidato remoto mal configurato facendolo apparire più
+		// veloce/economico di uno locale).
+		bandwidthMbps := dataStoreBandwidthMbps(c)
+		if bandwidthMbps <= 0 {
+			return execTime, nil, false
+		}
+		// Stessa proxy approssimata già usata in energyJoules() (nessuna
+		// dimensione di input per-task propagata: si riusa la dimensione
+		// media di OUTPUT della funzione come stand-in sia per il dato da
+		// scaricare — CT^f, δ^f — sia per quello da salvare — CS^f, δe^f).
+		dataBytes := metrics.GetMetrics().AvgOutputSize[fn.Name]
+		bandwidthBytesPerSec := bandwidthMbps * 1_000_000 / 8
+		completion += time.Duration(dataBytes / bandwidthBytesPerSec * float64(time.Second))
+
+		// Costo di trasferimento (CT^f, Eq. 14) e di storage (CS^f, Eq. 15):
+		// entrambi 0 per esecuzione locale (stessa convenzione già in uso
+		// per transferEnergy in energyJoules — nessun movimento di rete né,
+		// per lo storage locale/edge, un costo da modellare: coerente con
+		// l'esclusione "j ∈ S \ SE" di Eq. 15 nel paper, che tiene lo
+		// storage edge fuori dal costo).
+		transferCost = dataStoreTransferCostPerByte(c) * dataBytes
+		storageCost = dataStoreStorageCostPerByte(c) * dataBytes
 	}
+
 	if !math.IsInf(residualDeadline, 1) && completion.Seconds() > residualDeadline {
 		return execTime, nil, false // vincolo di deadline, Eq. 5
 	}
 
 	energyJ := energyJoules(c, fn, execTime)
-	carbonG := (energyJ / 3.6e6) * c.co2Intensity // Eq. 10, stessa conversione J->kWh di emissions.joulesToKWh
-	cost := regionCost(c.area) * execTime         // Eq. 13, ΔC_i · ψ_i^f
+	// [LIMITE NOTO, non risolto qui — vedi "Domande ancora aperte"] Eq. 10
+	// del paper distingue l'intensità di carbonio del CANDIDATO (ξ_i, per la
+	// componente di esecuzione) da quella dello STORAGE (ξ_j, per la
+	// componente dati): Serverledge non modella però nessuna posizione né
+	// intensità di carbonio separata per lo storage (StatusInformation ha
+	// solo CO2Intensity del nodo/area di calcolo) — ξ_j non è disponibile
+	// da nessuna parte nel framework. Si continua quindi a usare ξ_i anche
+	// per la componente dati (energyJ include già sia compute che transfer,
+	// vedi energyJoules), un'approssimazione pre-esistente, non introdotta
+	// qui: separarla davvero richiederebbe prima che Serverledge esponga
+	// una CO2Intensity per lo storage, non solo per i nodi di calcolo.
+	carbonG := (energyJ / 3.6e6) * c.co2Intensity                    // Eq. 10, stessa conversione J->kWh di emissions.joulesToKWh
+	cost := regionCost(c.area)*execTime + transferCost + storageCost // Eq. 13 (ΔC_i · ψ_i^f) + Eq. 14 + Eq. 15
 
 	return execTime, &elEstimate{
 		candidate:      c,
@@ -806,13 +932,95 @@ func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics,
 	}, true
 }
 
-// energyJoules è la traduzione diretta dell'Eq. 7 del paper (E^f), senza il
-// termine di potenza idle ε_i: deciso 02/10 di ignorarlo per ora, in linea
-// col paper originale. Qui si scrive la formula per esteso, invece di
-// richiamare internal/emissions.Compute(), perché quella funzione è
-// pensata per il modello ad "edge aggregato" della policy CO2/QoS
-// (parametri InitialNode/LocalNode/AggrInitialNodeMemory) e non per un
-// confronto diretto tra istanze candidate come qui serve.
+// estimateInitTime stima λ_i^f (Eq. 2): il contributo ATTESO del cold start
+// alla preparazione del task, cioè tempo medio di init osservato * probabilità
+// di cold start — stesso approccio di prepareParameters() in
+// remote_offloading_policy.go (ILP/HEFTless), replicato qui fedelmente
+// INCLUSA una piccola asimmetria: per il CLOUD,
+// una probabilità mancante nella mappa (RemoteColdStartProbability) vale 0.0
+// (il valore di default di una map[string]float64 in Go), cioè "nessun cold
+// start atteso"; per un nodo edge/locale invece manca lo stesso default
+// implicito e il codice ne mette uno esplicito a 1.0 ("sempre cold") quando
+// il dato non c'è.
+func estimateInitTime(rm metrics.RetrievedMetrics, c elCandidate, funcName string) float64 {
+	clampProb := func(p float64) float64 {
+		if math.IsNaN(p) || math.IsInf(p, 1) {
+			return 1.0
+		}
+		if p < 0.0 {
+			return 0.0
+		}
+		return p
+	}
+
+	if c.key == "CLOUD" {
+		prob := clampProb(rm.RemoteColdStartProbability[funcName])
+		if t, ok := rm.AvgRemoteInitTime[funcName]; ok {
+			return t * prob
+		}
+		return 0.01 * prob // nessun dato di init time: stessa stima generica "a naso" usata altrove in questo file
+	}
+
+	nId := node.NodeID{Area: c.area, Key: c.key}
+	prob := 1.0
+	if nodeProbs, found := rm.EdgeColdStartProbability[nId.String()]; found {
+		if p, found := nodeProbs[funcName]; found {
+			prob = clampProb(p)
+		}
+	}
+	if nodeTimes, found := rm.AvgEdgeInitTime[nId.String()]; found {
+		if t, found := nodeTimes[funcName]; found {
+			return t * prob
+		}
+	}
+	return 0.01 * prob
+}
+
+// dataStoreBandwidthMbps/dataStoreTransferCostPerByte/dataStoreStorageCostPerByte
+// centralizzano la scelta tra configurazione "verso il cloud" e "verso un
+// nodo edge/locale", usata sia per il vincolo di banda e il tempo di
+// trasferimento sia per i nuovi termini di costo — un solo punto invece di
+// ripetere lo stesso "if c.key == CLOUD" in più punti del file.
+func dataStoreBandwidthMbps(c elCandidate) float64 {
+	if c.key == "CLOUD" {
+		return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_CLOUD_TO_DATA_STORE_BANDWIDTH, 1000)
+	}
+	return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_NODE_TO_DATA_STORE_BANDWIDTH, 40.0)
+}
+
+func dataStoreTransferCostPerByte(c elCandidate) float64 {
+	if c.key == "CLOUD" {
+		return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CLOUD_TO_DATA_STORE_TRANSFER_COST, 0.0)
+	}
+	return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_NODE_TO_DATA_STORE_TRANSFER_COST, 0.0)
+}
+
+func dataStoreStorageCostPerByte(c elCandidate) float64 {
+	if c.key == "CLOUD" {
+		return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CLOUD_TO_DATA_STORE_STORAGE_COST, 0.0)
+	}
+	return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_NODE_TO_DATA_STORE_STORAGE_COST, 0.0)
+}
+
+// energyJoules è la traduzione diretta dell'Eq. 7 del paper (E^f). Qui si
+// scrive la formula per esteso, invece di richiamare
+// internal/emissions.Compute(), perché quella funzione è pensata per il
+// modello ad "edge aggregato" della policy CO2/QoS (parametri
+// InitialNode/LocalNode/AggrInitialNodeMemory) e non per un confronto
+// diretto tra istanze candidate come qui serve.
+//
+// TODO – NOTA sulla forma: nell'Eq. 7 del paper ε_i compare come termine additivo
+// semplice, non moltiplicato per execTimeSec — eppure la tabella delle
+// notazioni lo definisce come una POTENZA (W), non un'energia (J), la
+// stessa unità di τ_i che invece viene moltiplicato per il tempo. È
+// un'imprecisione dimensionale del paper stesso, non introdotta qui: si
+// replica la formula così com'è scritta (somma diretta di idlePowerW,
+// senza moltiplicarlo per execTimeSec), perché è quello che è stato chiesto
+// esplicitamente ("sommarli in energyJoules") e la forma letterale
+// dell'equazione. Se si preferisse invece un'energia idle PROPORZIONALE al
+// tempo di esecuzione (idlePowerW * execTimeSec, dimensionalmente più
+// corretto e più vicino a come la potenza idle viene trattata altrove,
+// es. Eq. 13 di FGCS2026.pdf).
 func energyJoules(c elCandidate, f *function.Function, execTimeSec float64) float64 {
 	const memoryUnitMB = 2048.0 // stessa costante di internal/emissions/emissions.go
 	cpuUsage := f.CPUDemand
@@ -820,6 +1028,7 @@ func energyJoules(c elCandidate, f *function.Function, execTimeSec float64) floa
 		cpuUsage = 1.0
 	}
 	computeEnergy := c.procPowerW * (float64(f.MemoryMB) / memoryUnitMB) * execTimeSec * cpuUsage
+	idleEnergy := c.idlePowerW // ε_i, Eq. 7 — vedi nota sulla forma letterale sopra
 
 	outputBytes := metrics.GetMetrics().AvgOutputSize[f.Name]
 	// L'input non è propagato per-task (stesso limite di remote_offloading_policy.go,
@@ -833,7 +1042,7 @@ func energyJoules(c elCandidate, f *function.Function, execTimeSec float64) floa
 		transferEnergy = 0 // nessun trasferimento di rete per l'esecuzione locale
 	}
 
-	return computeEnergy + transferEnergy
+	return computeEnergy + idleEnergy + transferEnergy
 }
 
 // estimateExecTime riusa esattamente lo stesso approccio di
@@ -856,23 +1065,6 @@ func estimateExecTime(rm metrics.RetrievedMetrics, c elCandidate, funcName strin
 		}
 	}
 	return 0
-}
-
-// transferTime stima il tempo di trasferimento dati verso un'istanza non
-// locale, riusando le stesse chiavi di banda già configurate per ILP/HEFTless.
-func transferTime(c elCandidate, f *function.Function) time.Duration {
-	outputBytes := metrics.GetMetrics().AvgOutputSize[f.Name]
-	var bandwidthMbps float64
-	if c.key == "CLOUD" {
-		bandwidthMbps = config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_CLOUD_TO_DATA_STORE_BANDWIDTH, 1000)
-	} else {
-		bandwidthMbps = config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_NODE_TO_DATA_STORE_BANDWIDTH, 40.0)
-	}
-	if bandwidthMbps <= 0 {
-		return 0
-	}
-	bandwidthBytesPerSec := bandwidthMbps * 1_000_000 / 8
-	return time.Duration(outputBytes / bandwidthBytesPerSec * float64(time.Second))
 }
 
 // regionCost riusa la stessa config di ILP/HEFTless (region.cost), incluso
@@ -900,12 +1092,6 @@ func maxFloat(a, b float64) float64 {
 }
 
 // ---------------------------------------------------------------------
-// [CONFERMATO, non più da aggiungere]: workflow.go::CreateOffloadingPolicy()
-// ha già il branch "energyless" -> &EnergyLessPolicy{} accanto a ilp/
-// heftless/threshold, verificato leggendo lo zip del progetto.
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
 // Domande ancora aperte (aggiornato dopo il ricevimento del 02/10):
 //
 //  1. [AGGIORNATO] Esecuzione effettiva della variante scelta: quando
@@ -920,7 +1106,7 @@ func maxFloat(a, b float64) float64 {
 //     Verificato leggendo internal/workflow/function_task.go reale: (c) è
 //     escluso con certezza — execute()/exec() leggono sempre e solo
 //     s.Func, nessun override da Request/Progress/altrove.
-//     (b) è stata anche ESCLUSA, non solo "da verificare": FunctionTask è
+//     (b) è stata anche ESCLUSA: FunctionTask è
 //     sempre un puntatore (Task "must be pointers to a struct", task.go),
 //     e Workflow.Tasks è una map[TaskId]Task. Get()/getFromCache() in
 //     workflow.go, in caso di cache hit, fa "fc := *cachedObj.(*Workflow)"
@@ -939,7 +1125,7 @@ func maxFloat(a, b float64) float64 {
 //     il gap principale della feature varianti.
 //     [NUOVO, trovato il 16/10 leggendo a fondo internal/scheduling durante
 //     la revisione del pull — non è una modifica di Cecilia in questo pull,
-//     è infrastruttura già esistente che non avevo ancora notato]: un
+//     è infrastruttura già esistente]: un
 //     meccanismo equivalente a "esegui la variante X invece della base"
 //     ESISTE GIÀ, ma a un livello diverso da workflow.OffloadingDecision —
 //     vive in internal/scheduling, lo strato di scheduling della SINGOLA
@@ -949,7 +1135,7 @@ func maxFloat(a, b float64) float64 {
 //     nil; è scritto SOLO da Co2QosAwarePolicy (co2_qos_policy.go:357,
 //     "r.executionTarget = execFun") quando quella policy di scheduling
 //     sceglie una variante per una richiesta già arrivata a quello strato.
-//     Il problema per noi: scheduling.SubmitRequest(r *function.Request) è
+//     TODO: Il problema per noi: scheduling.SubmitRequest(r *function.Request) è
 //     il punto in cui function_task.go passa la richiesta allo scheduling
 //     (function_task.go:113), e function.Request (internal/function/request.go)
 //     NON ha nessun campo per portare una "variante preferita" scelta a
@@ -1026,9 +1212,31 @@ func maxFloat(a, b float64) float64 {
 //     modifica, che riguardava solo la CO2).
 //  6. [AGGIORNATO] cacheSolution/getCachedPlan ora replicano fedelmente la
 //     logica reale di ILP/HEFTless (verificata sul file
-//     remote_offloading_policy.go, non più un'ipotesi) ma restano una copia
+//     remote_offloading_policy.go) ma restano una copia
 //     locale e non una funzione condivisa, perché il tipo del valore in
 //     cache è diverso: qui map[TaskId]*elEstimate, nell'originale
 //     taskPlacement = map[TaskId]string. Un refactor verso un helper
 //     generico condiviso resta possibile come lavoro successivo.
+//  7. [NUOVO 17/10, dalla voce "Da sistemare" su costo/CO2 incompleti]
+//     Intensità di carbonio dello STORAGE (ξ_j, Eq. 10): il paper la tiene
+//     distinta da quella del candidato di calcolo (ξ_i), ma Serverledge non
+//     modella da nessuna parte una posizione né una CO2Intensity per lo
+//     storage/data-store — solo per i nodi di calcolo
+//     (registration.StatusInformation.CO2Intensity). estimateOnCandidate()
+//     continua quindi ad approssimare ξ_j con ξ_i (vedi commento lì), non
+//     per scelta ma per mancanza del dato. Da chiedere a Cecilia: ha senso
+//     introdurre un concetto di "regione/CO2Intensity dello storage" in
+//     Serverledge (es. nel file regioni, come già esiste per i nodi), o è
+//     un dettaglio che EnergyLessPolicy può continuare a trascurare? Nel
+//     frattempo, costo di trasferimento (CT^f) e di storage (CS^f) SONO
+//     stati aggiunti (punto 14 in testa al file) con due nuove coppie di
+//     chiavi, già promosse in internal/config/keys.go.
+//  8. [NUOVO 17/10, dalla voce "Da sistemare" su potenza idle] Reintegrata
+//     ε_i nell'Eq. 7 (elCandidate.idlePowerW, sommata in energyJoules). Da
+//     menzionare esplicitamente al prossimo ricevimento, non darla per
+//     acquisita. Resta anche da chiarire una forma dimensionalmente poco
+//     pulita ereditata dal paper stesso (Eq. 7 somma ε_i direttamente,
+//     senza moltiplicarlo per il tempo di esecuzione, pur definendolo come
+//     potenza — vedi nota sopra energyJoules()): può restare così com'è
+//     scritta nel paper, o conviene scalarla per execTimeSec?
 // ---------------------------------------------------------------------
