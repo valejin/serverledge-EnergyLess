@@ -239,9 +239,17 @@ import (
 //
 // Banda, costo di regione, potenze e CO2 riusano chiavi già esistenti
 // (region.cost, node2datastore.bandwidth, cloud2datastore.bandwidth,
-// consumption.processing.power/.energy.tx/.rx, regions.file.path). La soglia
-// minima di accuratezza non è una chiave di configurazione: è la costante
-// defaultMinAccuracy, sovrascrivibile per richiesta con RequestQoS.MinAccuracy.
+// consumption.processing.power/.energy.tx/.rx, regions.file.path).
+//
+// [NUOVO 06/11, suggerimento di Cecilia] I parametri della policy (pesi,
+// placement TTL, soglia di accuratezza di default, costi verso il data store)
+// possono stare in un file YAML dedicato, indicato dalla chiave
+// WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CONFIG_PATH (vedi energyless_config.go
+// ed examples/energyless/energyless-config.yaml). Priorità: file > chiavi
+// principali sopra elencate (fallback) > default nel codice. La soglia minima
+// di accuratezza è defaultMinAccuracy (0.95) oppure il valore del file
+// (default.min.accuracy), sovrascrivibile per richiesta con
+// RequestQoS.MinAccuracy (--min-accuracy da CLI).
 // ---------------------------------------------------------------------
 
 // energyLessWeights sono i pesi γ1..γ4 dell'Eq. 22 del paper (tempo,
@@ -277,6 +285,14 @@ type EnergyLessPolicy struct {
 	cache        map[string]*energyLessCacheEntry // chiave: r.Id — valori puntatore come in placementCache (ILP/HEFTless), per poter decrementare ttl in-place
 	cacheTTLInit int                              // numero di letture consentite prima della scadenza (vedi energyLessCacheEntry)
 
+	// Parametri risolti in Init() da loadEnergyLessParams()
+	// (energyless_config.go): file YAML dedicato > chiavi principali > default.
+	defaultMinAccuracy float64 // soglia usata se la richiesta non ha MinAccuracy
+	nodeTransferCost   float64 // costo/byte verso il data store, nodo locale/edge
+	cloudTransferCost  float64 // idem, cloud
+	nodeStorageCost    float64
+	cloudStorageCost   float64
+
 	// cloudCO2Mu/lastKnownCloudCO2/hasLastKnownCloudCO2: fallback per la
 	// query live della CO2Intensity del cloud (vedi gatherCandidates()).
 	// Confermato da Cecilia via mail (16/10) che il fallback "ingenuo" sulla
@@ -297,12 +313,15 @@ type EnergyLessPolicy struct {
 }
 
 func (policy *EnergyLessPolicy) Init() {
-	policy.weights = energyLessWeights{
-		time:   config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_WEIGHT_TIME, 0.25),
-		energy: config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_WEIGHT_ENERGY, 0.25),
-		carbon: config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_WEIGHT_CARBON, 0.25),
-		cost:   config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_WEIGHT_COST, 0.25),
-	}
+	// Parametri: file YAML dedicato (se configurato) > chiavi principali >
+	// default — vedi energyless_config.go.
+	params := loadEnergyLessParams()
+	policy.weights = params.weights
+	policy.defaultMinAccuracy = params.defaultMinAccuracy
+	policy.nodeTransferCost = params.nodeTransferCost
+	policy.cloudTransferCost = params.cloudTransferCost
+	policy.nodeStorageCost = params.nodeStorageCost
+	policy.cloudStorageCost = params.cloudStorageCost
 
 	if regionsFile := config.GetString(config.REGIONS_FILE_PATH, ""); regionsFile != "" {
 		cfg, err := regions.Load(regionsFile)
@@ -335,7 +354,7 @@ func (policy *EnergyLessPolicy) Init() {
 	// allineato a quello di HEFTless (9999), non a quello di ILP. Il default
 	// precedente (5) era arbitrario e avrebbe forzato un ricalcolo indesiderato
 	// a metà di richieste con più di 5 round.
-	policy.cacheTTLInit = config.GetInt(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_PLACEMENT_TTL, 9999)
+	policy.cacheTTLInit = params.placementTTL
 }
 
 // elCandidate è l'equivalente locale di una "istanza" I del paper: un nodo
@@ -385,10 +404,15 @@ const accuracyEpsilon = 1e-9
 // se impostato (> 0), altrimenti defaultMinAccuracy. Un valore > 1 è
 // irraggiungibile (l'accuratezza è un prodotto di fattori ≤ 1) e viene
 // limitato a 1, cioè "solo funzioni base, nessuna variante degradata".
-func minAccuracyThreshold(r *Request) float64 {
+func (policy *EnergyLessPolicy) minAccuracyThreshold(r *Request) float64 {
 	t := r.QoS.MinAccuracy
 	if t <= 0 {
-		t = defaultMinAccuracy
+		// Soglia di default: file YAML dedicato > costante defaultMinAccuracy
+		// (anche se la policy non è passata da Init()).
+		t = policy.defaultMinAccuracy
+		if t <= 0 {
+			t = defaultMinAccuracy
+		}
 	}
 	if t > 1 {
 		t = 1
@@ -492,7 +516,7 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 	// 1), quindi un task iniziale può consumare tutto il budget e costringere
 	// i successivi alla funzione base, senza ottimizzare il budget sull'intera
 	// catena.
-	minAccuracy := minAccuracyThreshold(r)
+	minAccuracy := policy.minAccuracyThreshold(r)
 	accChain := 1.0
 
 	for len(queue) > 0 {
@@ -1101,8 +1125,8 @@ func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics,
 		// (vedi dataStoreTransferCostPerByte/dataStoreStorageCostPerByte),
 		// default 0.0: finché non vengono impostate esplicitamente, nessun
 		// cambio di comportamento per chi già usa questa bozza.
-		transferCost = dataStoreTransferCostPerByte(c) * dataBytes
-		storageCost = dataStoreStorageCostPerByte(c) * dataBytes
+		transferCost = policy.dataStoreTransferCostPerByte(c) * dataBytes
+		storageCost = policy.dataStoreStorageCostPerByte(c) * dataBytes
 	}
 
 	if !math.IsInf(residualDeadline, 1) && completion.Seconds() > residualDeadline {
@@ -1204,18 +1228,18 @@ func dataStoreBandwidthMbps(c elCandidate) float64 {
 	return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_NODE_TO_DATA_STORE_BANDWIDTH, 40.0)
 }
 
-func dataStoreTransferCostPerByte(c elCandidate) float64 {
+func (policy *EnergyLessPolicy) dataStoreTransferCostPerByte(c elCandidate) float64 {
 	if c.key == "CLOUD" {
-		return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CLOUD_TO_DATA_STORE_TRANSFER_COST, 0.0)
+		return policy.cloudTransferCost
 	}
-	return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_NODE_TO_DATA_STORE_TRANSFER_COST, 0.0)
+	return policy.nodeTransferCost
 }
 
-func dataStoreStorageCostPerByte(c elCandidate) float64 {
+func (policy *EnergyLessPolicy) dataStoreStorageCostPerByte(c elCandidate) float64 {
 	if c.key == "CLOUD" {
-		return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CLOUD_TO_DATA_STORE_STORAGE_COST, 0.0)
+		return policy.cloudStorageCost
 	}
-	return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_NODE_TO_DATA_STORE_STORAGE_COST, 0.0)
+	return policy.nodeStorageCost
 }
 
 // energyJoules è la traduzione diretta dell'Eq. 7 del paper (E^f). Qui si

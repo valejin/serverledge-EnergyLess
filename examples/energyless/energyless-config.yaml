@@ -1,0 +1,36 @@
+# Parametri di EnergyLessPolicy (workflow offloading policy "energyless").
+#
+# Il file viene letto all'avvio del nodo se nel file di configurazione
+# principale è presente:
+#   workflow.offloading.policy: energyless
+#   workflow.offloading.policy.energyless.config.path: examples/energyless/energyless-config.yaml
+#
+# Tutte le chiavi sono facoltative: una chiave assente usa il valore della
+# corrispondente chiave "workflow.offloading.policy.energyless.*" del file
+# principale (se presente) o il default indicato qui sotto. Una chiave
+# sconosciuta (refuso) fa ignorare l'intero file, con un messaggio nel log.
+
+# Pesi dell'obiettivo (Eq. 22 del paper). Contano solo i valori relativi
+# (l'obiettivo è normalizzato per task). Valori >= 0.
+weight.time: 0
+weight.energy: 1.0
+weight.carbon: 0
+weight.cost: 0
+
+
+# Quante volte il piano calcolato per una richiesta può essere riletto dalla
+# cache prima di scadere. 9999 = praticamente "piano unico per richiesta"
+# (come HEFTless); 1 = ricalcolo a quasi ogni round (come ILP). Valore > 0.
+placement.ttl: 9999
+
+# Soglia minima di accuratezza complessiva del workflow, usata quando la
+# richiesta non specifica RequestQoS.MinAccuracy (--min-accuracy da CLI).
+# La soglia della richiesta ha sempre la precedenza. Valore in (0, 1].
+default.min.accuracy: 0.8
+
+# Costi di trasferimento (Eq. 14) e di storage (Eq. 15) verso il data store,
+# per byte. Default 0.0 (termini di costo azzerati). Valori >= 0.
+node2datastore.transfer.cost: 0.0
+cloud2datastore.transfer.cost: 0.0
+node2datastore.storage.cost: 0.0
+cloud2datastore.storage.cost: 0.0

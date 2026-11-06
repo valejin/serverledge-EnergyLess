@@ -216,3 +216,5 @@ const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CLOUD_TO_DATA_STORE_TRANSFER_COST = 
 // Eq. 15 del paper) — costo per byte salvato. Default 0.0 se non impostata.
 const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_NODE_TO_DATA_STORE_STORAGE_COST = "workflow.offloading.policy.energyless.node2datastore.storage.cost"
 const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CLOUD_TO_DATA_STORE_STORAGE_COST = "workflow.offloading.policy.energyless.cloud2datastore.storage.cost"
+
+const WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CONFIG_PATH = "workflow.offloading.policy.energyless.config.path"

@@ -99,7 +99,7 @@ var compName, funcName, runtime, handler, customImage, src, jsonSrc string
 var qosClass int64
 var requestId string
 var memory int64
-var cpuDemand, qosMaxRespT float64
+var cpuDemand, qosMaxRespT, qosMinAccuracy float64
 var inputs []string
 var outputs []string
 var params []string
@@ -165,6 +165,7 @@ func Init() {
 	rootCmd.AddCommand(compInvokeCmd)
 	compInvokeCmd.Flags().StringVarP(&compName, "workflow", "f", "", "name of the workflow")
 	compInvokeCmd.Flags().Float64VarP(&qosMaxRespT, "resptime", "r", -1.0, "Max. response time (optional)")
+	compInvokeCmd.Flags().Float64VarP(&qosMinAccuracy, "min-accuracy", "", 0, "Min. workflow accuracy in (0,1] (optional; if omitted the policy default applies)")
 	compInvokeCmd.Flags().Int64VarP(&qosClass, "class", "c", 0, "QoS class ID (optional)")
 	compInvokeCmd.Flags().StringSliceVarP(&params, "param", "p", nil, "Workflow parameter: <name>:<value>")
 	compInvokeCmd.Flags().StringVarP(&paramsFile, "params_file", "j", "", "File containing parameters (JSON) for workflow")
@@ -572,12 +573,19 @@ func invokeWorkflow(cmd *cobra.Command, args []string) {
 		}
 	}
 
+	// Il flag --min-accuracy, se presente, deve essere in (0,1]; 0 = non impostato
+	if qosMinAccuracy < 0 || qosMinAccuracy > 1 {
+		fmt.Println("Error: --min-accuracy must be in (0,1]")
+		os.Exit(1)
+	}
+
 	request := client.WorkflowInvocationRequest{
 		Params:          paramsMap,
 		CanDoOffloading: true,
 		QoS: function.RequestQoS{
-			Class:    qosClass,
-			MaxRespT: qosMaxRespT,
+			Class:       qosClass,
+			MaxRespT:    qosMaxRespT,
+			MinAccuracy: qosMinAccuracy,
 		},
 		Async: asyncInvocation}
 	invocationBody, err := json.Marshal(request)
