@@ -13,6 +13,9 @@ type OffloadingPolicy interface {
 
 type OffloadingPlan struct {
 	ToExecute []TaskId
+	// Variants: variante da eseguire per i task di ToExecute che non usano la
+	// funzione base (task -> nome della variante). Opzionale.
+	Variants map[TaskId]string
 }
 
 type NoOffloadingPolicy struct{}

@@ -21,6 +21,9 @@ type Request struct {
 type RequestQoS struct {
 	Class    int64
 	MaxRespT float64
+	// MinAccuracy è la soglia minima di accuratezza complessiva del workflow,
+	// in (0,1]. Se <= 0, EnergyLessPolicy usa il default (95%).
+	MinAccuracy float64
 }
 
 type ExecutionReport struct {

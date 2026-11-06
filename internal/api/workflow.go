@@ -175,11 +175,19 @@ func ResumeWorkflow(e echo.Context) error {
 	req.ExecReport.Result = nil // NOTE: this should be nil until workflow completion
 	req.ExecReport.Reports = map[string]*function.ExecutionReport{}
 
-	if clientReq.Plan.ToExecute != nil {
+	/*if clientReq.Plan.ToExecute != nil {
 		req.Plan = &workflow.OffloadingPlan{ToExecute: clientReq.Plan.ToExecute}
 	} else {
 		req.Plan = nil
+	} */
+	if clientReq.Plan.ToExecute != nil {
+		req.Plan = &workflow.OffloadingPlan{ToExecute: clientReq.Plan.ToExecute, Variants: clientReq.Plan.Variants}
+	} else {
+		req.Plan = nil
 	}
+	// Varianti scelte dal nodo di origine per i task offloadati (nil se assenti;
+	// assegnare sempre il campo evita di ereditarlo da un uso precedente del pool).
+	req.Variants = clientReq.Plan.Variants
 
 	log.Printf("Resuming workflow '%s'", workflowName)
 
@@ -214,6 +222,7 @@ func InvokeWorkflow(e echo.Context) error {
 	req.CanDoOffloading = clientReq.CanDoOffloading
 	req.Async = clientReq.Async
 	req.Plan = nil
+	req.Variants = nil // il Request viene dal pool: azzerare la scelta delle varianti <- aggiunto
 	req.Resuming = false
 	req.Id = fmt.Sprintf("%v-%s%d", wflow.Name, node.LocalNode.String()[len(node.LocalNode.String())-5:], req.Arrival.Nanosecond())
 	req.ExecReport.ResponseTime = 0.0

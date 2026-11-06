@@ -23,6 +23,12 @@ type Request struct {
 	Async           bool
 	Resuming        bool            // indicating whether the function is resuming from a previous (partial) execution
 	Plan            *OffloadingPlan // optional; execution plan
+	// Variants associa a un task (FunctionTask) il nome della variante da eseguire
+	// al posto della sua funzione. È per-richiesta (scritta dalla policy di
+	// offloading, o ricevuta nel piano in caso di ripresa remota): i task del
+	// workflow sono condivisi tra le richieste e non vanno modificati. Assente
+	// o nil significa che ogni task esegue la propria funzione.
+	Variants map[TaskId]string
 }
 
 func NewRequest(reqId string, workflow *Workflow, params map[string]interface{}, paramsSize uint64) *Request {

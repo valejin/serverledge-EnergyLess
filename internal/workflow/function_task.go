@@ -98,9 +98,15 @@ func (s *FunctionTask) exec(compRequest *Request, params ...map[string]interface
 		return nil, fmt.Errorf("FunctionTask.function is null: you must initialize FunctionTask's function to execute it")
 	}
 
+	// Funzione effettivamente eseguita: quella del task, oppure la variante
+	// scelta per questa richiesta dalla policy di offloading (compRequest.Variants).
+	// L'output viene comunque interpretato con la signature di funct (la funzione
+	// del task), che la variante deve rispettare.
+	execFunct := s.resolveVariant(compRequest, funct)
+
 	// the rest of the code is similar to a single function execution
 	r := &function.Request{
-		Fun:             funct,
+		Fun:             execFunct,
 		Params:          params[0],
 		Arrival:         time.Now(),
 		RequestQoS:      compRequest.QoS,
@@ -148,6 +154,43 @@ func (s *FunctionTask) exec(compRequest *Request, params ...map[string]interface
 	compRequest.ExecReport.Reports[CreateExecutionReportId(s)] = report
 
 	return outputData, nil
+}
+
+// resolveVariant ritorna la funzione da eseguire per questo task: la variante
+// scelta per la richiesta, se esiste ed è utilizzabile, altrimenti la funzione
+// base. Una variante non utilizzabile (non registrata, non variante di questa
+// funzione, signature diversa) non blocca l'esecuzione: si ripiega sulla base e
+// lo si scrive nel log.
+func (s *FunctionTask) resolveVariant(compRequest *Request, base *function.Function) *function.Function {
+	name := compRequest.Variants[s.Id]
+	if name == "" || name == base.Name {
+		return base
+	}
+
+	variant, found := function.GetFunction(name)
+	if !found {
+		log.Printf("[Rq-%v] variante %s del task %s non trovata: eseguo %s", compRequest.Id, name, s.Id, base.Name)
+		return base
+	}
+	if !variant.IsVariant() || variant.DefaultFunction != base.Name {
+		log.Printf("[Rq-%v] %s non è una variante di %s: eseguo %s", compRequest.Id, name, base.Name, base.Name)
+		return base
+	}
+	if !sameSignature(base.Signature, variant.Signature) {
+		log.Printf("[Rq-%v] la variante %s ha una signature diversa da %s: eseguo %s", compRequest.Id, name, base.Name, base.Name)
+		return base
+	}
+
+	log.Printf("[Rq-%v] task %s: eseguo la variante %s al posto di %s", compRequest.Id, s.Id, variant.Name, base.Name)
+	return variant
+}
+
+// sameSignature confronta due signature per ingressi e uscite (nome e tipo).
+func sameSignature(a, b *function.Signature) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.String() == b.String()
 }
 
 func (s *FunctionTask) CheckInput(input map[string]interface{}) error {
