@@ -1,0 +1,17 @@
+workflow.offloading.policy: energyless
+workflow.offloading.policy.region.cost:
+  rome: 0.0
+  cloud_region_a: 0.01
+consumption.processing.power: 100.0
+consumption.idle.power: 40.0
+consumption.energy.tx: 51200.0
+consumption.energy.rx: 30720.0
+metrics.enabled: true
+metrics.prometheus.host: 127.0.0.1
+metrics.prometheus.port: 9090
+metrics.retriever.interval: 15
+metrics.prometheus.pushgateway.host: 127.0.0.1
+metrics.prometheus.pushgateway.port: 9091
+workflow.offloading.policy.energyless.config.path: examples/energyless/energyless-config.yaml
+registry.remote.area: "cloud_region_a"
+regions.file.path: "./examples/energyless/regions-energyless.yaml"

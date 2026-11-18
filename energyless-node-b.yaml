@@ -1,0 +1,12 @@
+workflow.offloading.policy: energyless
+workflow.offloading.policy.region.cost:
+  rome: 0.01
+consumption.processing.power: 100.0
+consumption.idle.power: 40.0
+consumption.energy.tx: 51200.0
+consumption.energy.rx: 30720.0
+api.port: 1324
+registry.udp.port: 9877
+registry.area: "ROME"
+consumption.processing.power: 20.0
+consumption.idle.power: 5.0

@@ -201,6 +201,50 @@
 //     propria funzione. Modifiche fuori da questo file: workflow/request.go
 //     (Variants), workflow/offloading_policy.go (OffloadingPlan.Variants),
 //     workflow/function_task.go (resolveVariant), api/workflow.go.
+//  17. [BUG RISOLTO 11/11, gestione chiarita con Cecilia l'11/11] Task senza
+//     coppia (nodo, funzione) entro la deadline residua: buildPlan() faceva
+//     "continue" PRIMA di accodare il successore, quindi la visita si fermava
+//     e tutti i task successivi restavano fuori dal piano (in locale per
+//     sempre, piano in cache con TTL 9999). Ora il successore si accoda
+//     sempre. Cecilia: deadline impossibili (un task che da solo richiede più
+//     della deadline del workflow) sono un input incoerente, da evitare negli
+//     esperimenti (in futuro andrebbero rifiutate alla creazione del
+//     workflow); uno sforamento dovuto a condizioni cambiate a runtime è
+//     invece realistico: la richiesta si porta a termine ma, se sfora davvero,
+//     conta come NON completata (da misurare negli esperimenti confrontando il
+//     tempo di risposta con MaxRespT). Scelta implementativa: per il task che
+//     non sta nella deadline si prende la coppia più veloce (selectFastest),
+//     per ridurre il ritardo e quindi la probabilità di sforare davvero; il
+//     piano a rischio viene segnalato nel log una volta per richiesta.
+//  18. [NUOVO 11/11, suggerimento di Cecilia dell'11/11] Tempi senza
+//     metriche. Il ripiego di 0.01 s (esecuzione e init) è un valore
+//     generico, non adatto quando la funzione dura secondi: un nodo senza
+//     misure sembrerebbe velocissimo. Indicazione di Cecilia: fare un tuning
+//     preliminare (eseguire prima le funzioni, così Prometheus ha i tempi
+//     reali; vedi scripts/tune-energyless.sh) oppure usare default sensati.
+//     Ora i due ripieghi sono configurabili nel file YAML della policy
+//     (default.exec.time, default.init.time; senza chiavi resta 0.01 s). Per
+//     le varianti si usa lo SpeedUp DICHIARATO, che va registrato uguale a
+//     quello misurato durante il tuning. Corretto anche il ripiego della
+//     variante quando la funzione base non rientra nella deadline (vedi
+//     selectWithWeights).
+//  19. [DECISO 15/11] CO2 senza energia idle, coerente con il paper: l'Eq. 10
+//     (CO^f = ξ_i·E_exec + ξ_j·E_data) e l'Alg. 2 (riga 4) usano solo l'energia
+//     di esecuzione e dei dati; ε_i compare solo nell'energia (Eq. 7 -> Eq. 8,
+//     9 -> termine G della funzione obiettivo). Prima il codice moltiplicava
+//     per ξ_i l'energia totale, idle compresa: con potenze idle molto diverse
+//     tra nodi (es. cloud 300 W, edge 40 W) cambiava il confronto sul termine
+//     CO2. L'energia (energyJoules) resta invariata, idle compreso e scalato
+//     per il tempo (decisione del 22/10).
+//  20. [NUOVO 16/11] Misure del tuning salvate su file (energyless_tuning.go):
+//     scripts/tune-energyless.sh scrive tempi di esecuzione, di init e
+//     probabilità di cold start per funzione e tipo di nodo (edge/cloud) in un
+//     file YAML, indicato dalla chiave tuning.file nel file della policy.
+//     Servono perché le metriche Prometheus si perdono al riavvio di
+//     Prometheus/Pushgateway e, per gli edge, sono legate alla chiave del nodo
+//     (che cambia a ogni riavvio). Ordine: metrica live -> tuning da file ->
+//     default (punto 18). Per il cloud il file evita anche la probabilità di
+//     cold start 0 quando mancano le metriche.
 package workflow
 
 import (
@@ -293,6 +337,16 @@ type EnergyLessPolicy struct {
 	nodeStorageCost    float64
 	cloudStorageCost   float64
 
+	// Tempi di ripiego senza metriche Prometheus (punto 18): da
+	// default.exec.time / default.init.time nel file YAML della policy,
+	// altrimenti defaultFallbackTime.
+	defaultExecTime float64
+	defaultInitTime float64
+
+	// Misure del tuning lette da file (punto 20): usate quando manca la
+	// metrica live, prima dei default.
+	tuning energyLessTuning
+
 	// cloudCO2Mu/lastKnownCloudCO2/hasLastKnownCloudCO2: fallback per la
 	// query live della CO2Intensity del cloud (vedi gatherCandidates()).
 	// Confermato da Cecilia via mail (16/10) che il fallback "ingenuo" sulla
@@ -318,6 +372,9 @@ func (policy *EnergyLessPolicy) Init() {
 	params := loadEnergyLessParams()
 	policy.weights = params.weights
 	policy.defaultMinAccuracy = params.defaultMinAccuracy
+	policy.defaultExecTime = params.defaultExecTime
+	policy.defaultInitTime = params.defaultInitTime
+	policy.tuning = params.tuning
 	policy.nodeTransferCost = params.nodeTransferCost
 	policy.cloudTransferCost = params.cloudTransferCost
 	policy.nodeStorageCost = params.nodeStorageCost
@@ -382,7 +439,7 @@ type elEstimate struct {
 	functionName   string        // nome della funzione o VARIANTE effettivamente valutata (punto 1)
 	completionTime time.Duration // TT^f, Eq. 2-4
 	energyJoules   float64       // E^f, Eq. 7 (include ε_i idle dal 17/10, vedi energyJoules())
-	carbonGrams    float64       // CO^f, Eq. 10 (termine storage ξ_j: approssimato con ξ_i, confermato corretto 22/10 — vedi estimateOnCandidate)
+	carbonGrams    float64       // CO^f, Eq. 10 (senza ε_i idle dal 15/11, punto 19; termine storage ξ_j: approssimato con ξ_i, confermato corretto 22/10 — vedi estimateOnCandidate)
 	cost           float64       // Z^f = CC^f + CT^f + CS^f, Eq. 13+14+15
 	accuracy       float64       // ∈[0,1], [NUOVO 30/10] accuratezza della funzione/variante scelta rispetto a quella richiesta dal task: 1.0 per la funzione del task, Function.Utility per una variante sostituta (vedi selectBest)
 	objective      float64       // somma pesata normalizzata, Eq. 22
@@ -394,6 +451,29 @@ type elEstimate struct {
 // scelto "per il momento": promuoverlo a chiave di
 // configurazione (come i pesi γ1..γ4) se servirà variarlo negli esperimenti.
 const defaultMinAccuracy = 0.95
+
+// defaultFallbackTime (secondi) è il ripiego generico per tempo di esecuzione
+// e di init quando per una coppia (nodo, funzione) non c'è ancora nessuna
+// misura e il file della policy non indica default.exec.time /
+// default.init.time (punto 18). Stesso valore usato finora.
+const defaultFallbackTime = 0.01
+
+// fallbackExecTime e fallbackInitTime ritornano i tempi di ripiego
+// configurati, con defaultFallbackTime se la policy non è stata
+// inizializzata con Init() (es. nei test).
+func (policy *EnergyLessPolicy) fallbackExecTime() float64 {
+	if policy.defaultExecTime > 0 {
+		return policy.defaultExecTime
+	}
+	return defaultFallbackTime
+}
+
+func (policy *EnergyLessPolicy) fallbackInitTime() float64 {
+	if policy.defaultInitTime > 0 {
+		return policy.defaultInitTime
+	}
+	return defaultFallbackTime
+}
 
 // accuracyEpsilon assorbe gli errori di arrotondamento in virgola mobile nel
 // confronto tra prodotti di accuratezze e soglia (es. 0.95*1.0 vs 0.95).
@@ -519,6 +599,10 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 	minAccuracy := policy.minAccuracyThreshold(r)
 	accChain := 1.0
 
+	// deadlineAtRisk: il piano prevede già di sforare la deadline (punto 17),
+	// usato solo per loggarlo una volta per piano.
+	deadlineAtRisk := false
+
 	for len(queue) > 0 {
 		tid := queue[0]
 		queue = queue[1:]
@@ -546,17 +630,25 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 		// un ConditionalTask (ChoiceTask: il prossimo task dipende da dati
 		// a runtime, non calcolabile staticamente qui) o per un task senza
 		// alcun successore (EndTask e simili).
+		//
+		// [NUOVO 11/11, punto 17] Il successore si accoda SEMPRE, prima di
+		// qualunque "continue": prima, per un FunctionTask, l'accodamento era
+		// in fondo al ciclo, quindi un task senza coppia fattibile (o con
+		// funzione non trovata) interrompeva la visita e tutti i task
+		// successivi restavano fuori dal piano (eseguiti in locale per sempre,
+		// piano in cache con TTL 9999).
+		if ut, isUnary := task.(UnaryTask); isUnary {
+			if next := ut.GetNext(); next != "" {
+				queue = append(queue, next)
+			}
+		}
 		ft, isFunc := task.(*FunctionTask)
 		if !isFunc {
-			if ut, isUnary := task.(UnaryTask); isUnary {
-				if next := ut.GetNext(); next != "" {
-					queue = append(queue, next)
-				}
-			}
 			continue
 		}
 		f, found := function.GetFunction(ft.Func)
 		if !found {
+			log.Printf("EnergyLess: funzione %s del task %s non trovata, task lasciato fuori dal piano", ft.Func, tid)
 			continue
 		}
 
@@ -582,8 +674,26 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 		minTaskAccuracy := minAccuracy / accChain
 		best, err := policy.selectBest(f, candidates, remainingDeadline, minTaskAccuracy)
 		if err != nil {
-			log.Printf("EnergyLess: nessuna coppia fattibile per %s (task %s): %v", ft.Func, tid, err)
-			continue
+			// [NUOVO 11/11, punto 17 — chiarito con Cecilia l'11/11] Nessuna
+			// coppia rispetta la deadline residua. Con deadline coerenti (un
+			// task non può richiedere più della deadline dell'intero workflow:
+			// input da evitare negli esperimenti) succede solo se le condizioni
+			// cambiano durante l'esecuzione. In quel caso la richiesta
+			// probabilmente non rispetterà i requisiti e, se sfora davvero,
+			// andrà contata tra le NON completate; il processamento però si
+			// porta a termine. Per ridurre al minimo il ritardo (e quindi la
+			// probabilità di sforare davvero) si sceglie la coppia più veloce,
+			// ignorando la deadline e rispettando capacità e accuratezza.
+			best, err = policy.selectFastest(f, candidates, minTaskAccuracy)
+			if err != nil {
+				log.Printf("EnergyLess: nessuna coppia fattibile per %s (task %s), nemmeno ignorando la deadline: %v", ft.Func, tid, err)
+				continue
+			}
+			if !deadlineAtRisk {
+				deadlineAtRisk = true
+				log.Printf("EnergyLess: richiesta %s, il piano prevede di sforare la deadline al task %s (budget residuo %.3fs): scelta la coppia più veloce, %s su %s (%.3fs)",
+					r.Id, tid, remainingDeadline, best.functionName, best.candidate.key, best.completionTime.Seconds())
+			}
 		}
 		if best.functionName != f.Name {
 			// Ha vinto una variante: oltre al log, la scelta resta in
@@ -595,13 +705,34 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 		placement[tid] = best
 		elapsedChain += best.completionTime.Seconds()
 		accChain *= best.accuracy
-
-		if ft.NextTask != "" {
-			queue = append(queue, ft.NextTask)
-		}
 	}
 
+	logPlan(r.Id, placement, elapsedChain, residualDeadline)
 	return placement
+}
+
+// logPlan scrive il piano calcolato in una riga di log (una volta per piano):
+// per ogni task il nodo, la funzione o variante scelta e il tempo stimato, più
+// il tempo stimato della catena rispetto alla deadline residua. Serve a
+// verificare il piano negli esperimenti, dato che dai report dei task si vede
+// solo dove è stato eseguito ciascun task, non cosa aveva deciso la policy.
+func logPlan(reqId string, placement map[TaskId]*elEstimate, chainSec float64, residualDeadline float64) {
+	ids := make([]TaskId, 0, len(placement))
+	for tid := range placement {
+		ids = append(ids, tid)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	parts := make([]string, 0, len(ids))
+	for _, tid := range ids {
+		est := placement[tid]
+		parts = append(parts, fmt.Sprintf("%s->%s/%s %.3fs", tid, est.candidate.key, est.functionName, est.completionTime.Seconds()))
+	}
+	deadline := "nessuna"
+	if !math.IsInf(residualDeadline, 1) {
+		deadline = fmt.Sprintf("%.3fs", residualDeadline)
+	}
+	log.Printf("EnergyLess: piano per la richiesta %s (%d task, catena stimata %.3fs, deadline residua %s): %s",
+		reqId, len(ids), chainSec, deadline, strings.Join(parts, ", "))
 }
 
 // computeDecisionFromPlacement traduce il placement già calcolato (in
@@ -760,7 +891,11 @@ func (policy *EnergyLessPolicy) rankReadyTasks(r *Request, p *Progress, candidat
 		for _, c := range candidates {
 			t := estimateExecTime(rm, c, ft.Func)
 			if t <= 0 {
-				t = 0.01 // nessuna metrica reale ancora disponibile: stesso fallback generico di prima
+				if tv, ok := policy.tuning.lookup(c, ft.Func); ok && tv.execTime > 0 {
+					t = tv.execTime // misura del tuning da file (punto 20)
+				} else {
+					t = policy.fallbackExecTime() // nessuna metrica reale: default.exec.time (punto 18)
+				}
 			}
 			sum += t
 		}
@@ -983,6 +1118,21 @@ func validVariants(f *function.Function) []*function.Function {
 // nemmeno nella normalizzazione dell'Eq. 22, esattamente come una coppia
 // infattibile per deadline o capacità.
 func (policy *EnergyLessPolicy) selectBest(f *function.Function, candidates []elCandidate, residualDeadline float64, minTaskAccuracy float64) (*elEstimate, error) {
+	return policy.selectWithWeights(policy.weights, f, candidates, residualDeadline, minTaskAccuracy)
+}
+
+// selectFastest è il ripiego di buildPlan quando nessuna coppia rispetta la
+// deadline residua (punto 17): stessa enumerazione di selectBest (capacità,
+// banda e soglia di accuratezza restano vincoli), ma senza deadline e con
+// tutto il peso sul tempo, quindi sceglie la coppia con il completionTime
+// minimo.
+func (policy *EnergyLessPolicy) selectFastest(f *function.Function, candidates []elCandidate, minTaskAccuracy float64) (*elEstimate, error) {
+	return policy.selectWithWeights(energyLessWeights{time: 1.0}, f, candidates, math.Inf(1), minTaskAccuracy)
+}
+
+// selectWithWeights contiene la logica di selectBest con i pesi dell'Eq. 22
+// passati come parametro (usati solo per l'obiettivo, non per i vincoli).
+func (policy *EnergyLessPolicy) selectWithWeights(weights energyLessWeights, f *function.Function, candidates []elCandidate, residualDeadline float64, minTaskAccuracy float64) (*elEstimate, error) {
 	rm := metrics.GetMetrics()
 	var variants []*function.Function
 	for _, v := range validVariants(f) {
@@ -1003,7 +1153,7 @@ func (policy *EnergyLessPolicy) selectBest(f *function.Function, candidates []el
 
 	// iterazione su istanza i (= candidato)
 	for _, c := range candidates {
-		baseExecTime, baseEst, ok := policy.estimateOnCandidate(rm, c, f, f.Name, residualDeadline, 0.01)
+		baseExecTime, baseEst, ok := policy.estimateOnCandidate(rm, c, f, f.Name, residualDeadline, policy.fallbackExecTime())
 		if ok {
 			baseEst.accuracy = 1.0 // la funzione del task non è degradata
 			accumulate(baseEst)
@@ -1011,8 +1161,15 @@ func (policy *EnergyLessPolicy) selectBest(f *function.Function, candidates []el
 
 		// Varianti della stessa funzione, sullo stesso candidato (punto 1).
 		for _, v := range variants {
-			fallback := 0.01
-			if ok && v.SpeedUp > 0 {
+			fallback := policy.fallbackExecTime()
+			// [CORRETTO 11/11, punto 18] Prima la condizione era "ok &&
+			// SpeedUp > 0": se la funzione base non rientrava nella deadline
+			// (ok=false), la variante senza metriche ricadeva sul ripiego
+			// generico invece che su baseExecTime/SpeedUp, proprio nel caso
+			// in cui una variante più leggera conta di più. estimateOnCandidate
+			// ritorna execTime anche quando il candidato è scartato per la
+			// deadline (è 0 solo se scartato per capacità).
+			if baseExecTime > 0 && v.SpeedUp > 0 {
 				// Approssimazione quando non esistono ancora metriche reali
 				// per la variante su questo candidato: tempo della funzione
 				// base scalato per lo SpeedUp dichiarato — stesso approccio
@@ -1040,10 +1197,10 @@ func (policy *EnergyLessPolicy) selectBest(f *function.Function, candidates []el
 	var best *elEstimate
 	for i := range estimates {
 		e := &estimates[i]
-		e.objective = policy.weights.time*safeDiv(e.completionTime.Seconds(), maxTime) +
-			policy.weights.energy*safeDiv(e.energyJoules, maxEnergy) +
-			policy.weights.carbon*safeDiv(e.carbonGrams, maxCarbon) +
-			policy.weights.cost*safeDiv(e.cost, maxCost)
+		e.objective = weights.time*safeDiv(e.completionTime.Seconds(), maxTime) +
+			weights.energy*safeDiv(e.energyJoules, maxEnergy) +
+			weights.carbon*safeDiv(e.carbonGrams, maxCarbon) +
+			weights.cost*safeDiv(e.cost, maxCost)
 		if best == nil || e.objective < best.objective {
 			best = e
 		}
@@ -1055,8 +1212,8 @@ func (policy *EnergyLessPolicy) selectBest(f *function.Function, candidates []el
 // la coppia (fn, candidato). metricName è il nome usato per cercare le
 // metriche Prometheus reali (f.Name per la funzione base, v.Name per una
 // variante). fallbackExecTime è il tempo da usare quando non esiste ancora
-// una metrica reale per (candidato, metricName): 0.01s per la funzione
-// base, baseExecTime/SpeedUp per una variante (vedi selectBest).
+// una metrica reale per (candidato, metricName): default.exec.time per la
+// funzione base, baseExecTime/SpeedUp per una variante (vedi selectBest).
 // Ritorna anche execTime (utile al chiamante per calcolare il fallback
 // delle varianti) e ok=false se il candidato non è fattibile.
 //
@@ -1079,11 +1236,18 @@ func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics,
 	}
 
 	execTime = estimateExecTime(rm, c, metricName)
+	tv, tuned := policy.tuning.lookup(c, metricName)
+	if execTime <= 0 && tuned && tv.execTime > 0 {
+		// [NUOVO 16/11, punto 20] Nessuna metrica live: misura del tuning
+		// salvata su file, prima del ripiego (base/SpeedUp per una
+		// variante, default.exec.time per la funzione base).
+		execTime = tv.execTime
+	}
 	if execTime <= 0 {
 		execTime = fallbackExecTime
 	}
 	if execTime <= 0 {
-		execTime = 0.01
+		execTime = policy.fallbackExecTime()
 	}
 
 	// Cold start (λ_i^f, Eq. 2): tempo di init ATTESO, già pesato per la
@@ -1092,7 +1256,7 @@ func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics,
 	// sottostimando sistematicamente il completionTime di ogni candidato
 	// (di più per i remoti, dove un container caldo è meno probabile che in
 	// locale).
-	initTime := estimateInitTime(rm, c, metricName)
+	initTime := estimateInitTime(rm, c, metricName, policy.fallbackInitTime(), tv, tuned)
 	completion := time.Duration((execTime + initTime) * float64(time.Second))
 
 	var transferCost, storageCost float64
@@ -1146,7 +1310,13 @@ func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics,
 	// include già sia compute che transfer, vedi energyJoules): non è più
 	// un'approssimazione provvisoria in attesa di un dato mancante, è il
 	// comportamento corretto per questa architettura.
-	carbonG := (energyJ / 3.6e6) * c.co2Intensity                    // Eq. 10, stessa conversione J->kWh di emissions.joulesToKWh
+	//
+	// [DECISO 15/11, punto 19] Come nell'Eq. 10 del paper, la CO2 si calcola
+	// solo dall'energia di ESECUZIONE e dei DATI (CO^f = ξ_i·E_exec + ξ_j·E_data;
+	// anche l'Alg. 2, riga 4, non ha ε_i): l'energia idle ε_i resta nel
+	// termine dell'energia (Eq. 7) ma non entra nelle emissioni.
+	carbonJ := energyJ - idleEnergyJoules(c, execTime)
+	carbonG := (carbonJ / 3.6e6) * c.co2Intensity                    // Eq. 10, stessa conversione J->kWh di emissions.joulesToKWh
 	cost := regionCost(c.area)*execTime + transferCost + storageCost // Eq. 13 (ΔC_i · ψ_i^f) + Eq. 14 + Eq. 15
 
 	return execTime, &elEstimate{
@@ -1172,7 +1342,13 @@ func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics,
 // vero remote_offloading_policy.go, replicata per restare fedeli al
 // comportamento originale (segnalabile a Cecilia come possibile incoerenza,
 // ma non è stata introdotta da questa bozza).
-func estimateInitTime(rm metrics.RetrievedMetrics, c elCandidate, funcName string) float64 {
+func estimateInitTime(rm metrics.RetrievedMetrics, c elCandidate, funcName string, fallbackInit float64, tv tunedValues, tuned bool) float64 {
+	// [NUOVO 16/11, punto 20] Senza metriche live si usano le misure del
+	// tuning da file (tempo di init e probabilità di cold start), prima dei
+	// ripieghi generici.
+	if tuned && tv.initTime >= 0 {
+		fallbackInit = tv.initTime
+	}
 	clampProb := func(p float64) float64 {
 		if math.IsNaN(p) || math.IsInf(p, 1) {
 			return 1.0
@@ -1184,15 +1360,23 @@ func estimateInitTime(rm metrics.RetrievedMetrics, c elCandidate, funcName strin
 	}
 
 	if c.key == "CLOUD" {
-		prob := clampProb(rm.RemoteColdStartProbability[funcName])
+		prob := 0.0 // comportamento ereditato da ILP/HEFTless se manca ogni dato
+		if p, found := rm.RemoteColdStartProbability[funcName]; found {
+			prob = clampProb(p)
+		} else if tuned && tv.coldStartProb >= 0 {
+			prob = tv.coldStartProb // punto 20
+		}
 		if t, ok := rm.AvgRemoteInitTime[funcName]; ok {
 			return t * prob
 		}
-		return 0.01 * prob // nessun dato di init time: stessa stima generica "a naso" usata altrove in questo file
+		return fallbackInit * prob // nessun dato di init time: default.init.time (punto 18)
 	}
 
 	nId := node.NodeID{Area: c.area, Key: c.key}
 	prob := 1.0
+	if tuned && tv.coldStartProb >= 0 {
+		prob = tv.coldStartProb // punto 20: sostituito dalla metrica live se presente
+	}
 	if nodeProbs, found := rm.EdgeColdStartProbability[nId.String()]; found {
 		if p, found := nodeProbs[funcName]; found {
 			prob = clampProb(p)
@@ -1203,7 +1387,7 @@ func estimateInitTime(rm metrics.RetrievedMetrics, c elCandidate, funcName strin
 			return t * prob
 		}
 	}
-	return 0.01 * prob
+	return fallbackInit * prob // default.init.time (punto 18)
 }
 
 // Chiavi di configurazione NUOVE per il costo di trasferimento (Eq. 14) e di
@@ -1271,7 +1455,7 @@ func energyJoules(c elCandidate, f *function.Function, execTimeSec float64) floa
 		cpuUsage = 1.0
 	}
 	computeEnergy := c.procPowerW * (float64(f.MemoryMB) / memoryUnitMB) * execTimeSec * cpuUsage
-	idleEnergy := c.idlePowerW * execTimeSec // ε_i, Eq. 7 — Potenza × Tempo = Joule, confermato 22/10 (vedi nota sopra)
+	idleEnergy := idleEnergyJoules(c, execTimeSec) // ε_i, Eq. 7 — Potenza × Tempo = Joule, confermato 22/10 (vedi nota sopra)
 
 	outputBytes := metrics.GetMetrics().AvgOutputSize[f.Name]
 	// L'input non è propagato per-task (stesso limite di remote_offloading_policy.go,
@@ -1286,6 +1470,13 @@ func energyJoules(c elCandidate, f *function.Function, execTimeSec float64) floa
 	}
 
 	return computeEnergy + idleEnergy + transferEnergy
+}
+
+// idleEnergyJoules è il termine idle dell'Eq. 7 (ε_i), scalato per il tempo di
+// esecuzione come deciso il 22/10. È incluso nell'energia (energyJoules) ma
+// escluso dalla CO2 (estimateOnCandidate, punto 19), come nel paper.
+func idleEnergyJoules(c elCandidate, execTimeSec float64) float64 {
+	return c.idlePowerW * execTimeSec
 }
 
 // estimateExecTime riusa esattamente lo stesso approccio di

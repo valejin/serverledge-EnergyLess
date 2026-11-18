@@ -50,6 +50,14 @@ type energyLessFileConfig struct {
 	CloudTransferCost *float64 `yaml:"cloud2datastore.transfer.cost"`
 	NodeStorageCost   *float64 `yaml:"node2datastore.storage.cost"`
 	CloudStorageCost  *float64 `yaml:"cloud2datastore.storage.cost"`
+
+	// Tempi di ripiego (punto 18 in energyless_policy.go): usati solo quando
+	// per una coppia (nodo, funzione) non esiste ancora una metrica Prometheus.
+	DefaultExecTime *float64 `yaml:"default.exec.time"`
+	DefaultInitTime *float64 `yaml:"default.init.time"`
+
+	// File con i valori misurati dal tuning (punto 20, energyless_tuning.go).
+	TuningFile *string `yaml:"tuning.file"`
 }
 
 // energyLessParams sono i parametri risolti (file > chiavi principali >
@@ -62,6 +70,9 @@ type energyLessParams struct {
 	cloudTransferCost  float64
 	nodeStorageCost    float64
 	cloudStorageCost   float64
+	defaultExecTime    float64 // secondi, ripiego senza metrica di esecuzione
+	defaultInitTime    float64 // secondi, ripiego senza metrica di init (cold start)
+	tuning             energyLessTuning
 }
 
 // loadEnergyLessParams risolve i parametri della policy. Parte dai valori
@@ -82,6 +93,8 @@ func loadEnergyLessParams() energyLessParams {
 		cloudTransferCost:  config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CLOUD_TO_DATA_STORE_TRANSFER_COST, 0.0),
 		nodeStorageCost:    config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_NODE_TO_DATA_STORE_STORAGE_COST, 0.0),
 		cloudStorageCost:   config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CLOUD_TO_DATA_STORE_STORAGE_COST, 0.0),
+		defaultExecTime:    defaultFallbackTime,
+		defaultInitTime:    defaultFallbackTime,
 	}
 
 	path := config.GetString(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CONFIG_PATH, "")
@@ -108,8 +121,19 @@ func loadEnergyLessParams() energyLessParams {
 	overrideFloat(&p.cloudTransferCost, fc.CloudTransferCost, "cloud2datastore.transfer.cost", nonNegative)
 	overrideFloat(&p.nodeStorageCost, fc.NodeStorageCost, "node2datastore.storage.cost", nonNegative)
 	overrideFloat(&p.cloudStorageCost, fc.CloudStorageCost, "cloud2datastore.storage.cost", nonNegative)
+	positive := func(v float64) bool { return v > 0 }
+	overrideFloat(&p.defaultExecTime, fc.DefaultExecTime, "default.exec.time", positive)
+	overrideFloat(&p.defaultInitTime, fc.DefaultInitTime, "default.init.time", positive)
 	overrideFloat(&p.defaultMinAccuracy, fc.DefaultMinAccuracy, "default.min.accuracy",
 		func(v float64) bool { return v > 0 && v <= 1 })
+
+	if fc.TuningFile != nil && *fc.TuningFile != "" {
+		if t, err := loadEnergyLessTuning(*fc.TuningFile); err != nil {
+			log.Printf("EnergyLess: could not load tuning file %q: %v (using only Prometheus metrics and defaults)", *fc.TuningFile, err)
+		} else {
+			p.tuning = t
+		}
+	}
 
 	if fc.PlacementTTL != nil {
 		if *fc.PlacementTTL > 0 {
@@ -160,6 +184,6 @@ func logEnergyLessParams(p energyLessParams, path string) {
 	if path != "" {
 		source = "file " + path
 	}
-	log.Printf("EnergyLess: parameters from %s: weights(time=%.3g energy=%.3g carbon=%.3g cost=%.3g) placementTTL=%d defaultMinAccuracy=%.3g",
-		source, p.weights.time, p.weights.energy, p.weights.carbon, p.weights.cost, p.placementTTL, p.defaultMinAccuracy)
+	log.Printf("EnergyLess: parameters from %s: weights(time=%.3g energy=%.3g carbon=%.3g cost=%.3g) placementTTL=%d defaultMinAccuracy=%.3g defaultExecTime=%.3gs defaultInitTime=%.3gs",
+		source, p.weights.time, p.weights.energy, p.weights.carbon, p.weights.cost, p.placementTTL, p.defaultMinAccuracy, p.defaultExecTime, p.defaultInitTime)
 }

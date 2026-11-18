@@ -28,6 +28,20 @@ placement.ttl: 9999
 # La soglia della richiesta ha sempre la precedenza. Valore in (0, 1].
 default.min.accuracy: 0.8
 
+# Tempi di ripiego, in secondi, usati SOLO quando per una coppia (nodo,
+# funzione) non esiste ancora una misura in Prometheus. Il modo corretto di
+# evitarli è il tuning preliminare (scripts/tune-energyless.sh); in
+# alternativa conviene metterli vicini alla durata reale delle funzioni del
+# workload. Default 0.01 se assenti. Valori > 0.
+default.exec.time: 4.0
+default.init.time: 0.5
+
+# File con le misure del tuning (scritto da scripts/tune-energyless.sh): usato
+# quando manca la metrica live in Prometheus (es. dopo un riavvio di
+# Prometheus o del nodo), prima dei default qui sopra. Percorso relativo alla
+# cartella da cui si avvia il nodo.
+tuning.file: "examples/energyless/tuning-energyless.yaml"
+
 # Costi di trasferimento (Eq. 14) e di storage (Eq. 15) verso il data store,
 # per byte. Default 0.0 (termini di costo azzerati). Valori >= 0.
 node2datastore.transfer.cost: 0.0

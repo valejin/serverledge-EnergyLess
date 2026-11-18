@@ -1,0 +1,16 @@
+api.port: 1328
+registry.udp.port: 9870
+registry.area: "cloud_region_a"
+scheduler.policy: localonly
+container.pool.memory: 8192
+regions.file.path: "./examples/energyless/regions-energyless.yaml"
+consumption.processing.power: 800.0
+consumption.idle.power: 300.0
+consumption.energy.tx: 5120.0
+consumption.energy.rx: 3072.0
+metrics.enabled: true
+metrics.prometheus.host: 127.0.0.1
+metrics.prometheus.port: 9090
+metrics.prometheus.pushgateway.host: 127.0.0.1
+metrics.prometheus.pushgateway.port: 9091
+metrics.retriever.interval: 15

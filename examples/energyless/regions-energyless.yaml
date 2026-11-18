@@ -1,0 +1,12 @@
+regions:
+- name: ROME
+  co2.traces.file: ./co2_traces/FR_2023_hourly.csv
+- name: cloud_region_a
+  co2.traces.file: ./co2_traces/PL_2023_hourly.csv
+  consumption.processing.power: 800.0
+  consumption.idle.power: 300.0
+  consumption.energy.tx: 5120.0
+  consumption.energy.rx: 3072.0
+poll.interval.sec: 3
+header.timestamp: "Datetime (UTC)"
+header.intensity: "Carbon Intensity gCO₂eq/kWh (direct)"

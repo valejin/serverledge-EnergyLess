@@ -1,0 +1,12 @@
+# Misure del tuning di EnergyLessPolicy, scritte da scripts/tune-energyless.sh.
+# Lette dalla policy con la chiave tuning.file nel suo file YAML: usate quando
+# manca la metrica live da Prometheus, prima dei default (punto 20).
+# Edge: media sui nodi edge misurati; cloud: media sui nodi della regione cloud.
+measured: "2026-11-16 12:46"
+functions:
+  euler_standard:
+    edge: {exec.time: 4.2108, init.time: 0.7828, cold.start.prob: 0.0333}
+    cloud: {exec.time: 4.2438, init.time: 0.4736, cold.start.prob: 0.1000}
+  euler_light:
+    edge: {exec.time: 0.0472, init.time: 0.5381, cold.start.prob: 0.0333}
+    cloud: {exec.time: 0.0535, init.time: 0.5718, cold.start.prob: 0.1000}

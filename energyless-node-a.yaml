@@ -1,0 +1,15 @@
+workflow.offloading.policy: energyless
+workflow.offloading.policy.region.cost:
+  rome: 0.01
+consumption.processing.power: 100.0
+consumption.idle.power: 40.0
+consumption.energy.tx: 51200.0
+consumption.energy.rx: 30720.0
+registry.area: "ROME"
+consumption.processing.power: 400.0
+consumption.idle.power: 200.0
+workflow.offloading.policy.energyless.weight.time: 0.0
+workflow.offloading.policy.energyless.weight.energy: 1.0
+workflow.offloading.policy.energyless.weight.carbon: 0.0
+workflow.offloading.policy.energyless.weight.cost: 0.0
+workflow.offloading.policy.energyless.config.path: examples/energyless/energyless-config.yaml
