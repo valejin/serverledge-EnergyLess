@@ -10,11 +10,12 @@ import (
 // Use NewBuilder() to safely initialize it. Then use the available methods to iteratively build the workflow.
 // Finally use Build() to get the complete Workflow.
 type Builder struct {
-	workflow     Workflow
-	branches     int
-	prevNode     Task
-	errors       []error
-	BranchNumber int
+	workflow          Workflow
+	branches          int
+	prevNode          Task
+	errors            []error
+	BranchNumber      int
+	fanInPredecessors []Task // Terminal nodes of parallel branches that need to be joined (Fan-In)
 }
 
 func (b *Builder) appendError(err error) {
@@ -57,15 +58,9 @@ func (b *Builder) AddFunctionTaskWithId(f *function.Function, id string) *Builde
 	}
 	b.workflow.add(simpleNode)
 
-	switch prevTask := b.prevNode.(type) {
-	case UnaryTask:
-		err := prevTask.SetNext(simpleNode)
-		if err != nil {
-			b.appendError(err)
-			return b
-		}
-	default:
-		panic("Unsupported previous task:" + prevTask.String())
+	if err := b.chainToNext(simpleNode); err != nil {
+		b.appendError(err)
+		return b
 	}
 
 	b.prevNode = simpleNode
@@ -84,15 +79,10 @@ func (b *Builder) AddChoiceNode(conditions ...Condition) *ChoiceBranchBuilder {
 	choiceNode := NewChoiceTask(conditions)
 	b.branches = len(conditions)
 	b.workflow.add(choiceNode)
-	switch prevTask := b.prevNode.(type) {
-	case UnaryTask:
-		err := prevTask.SetNext(choiceNode)
-		if err != nil {
-			b.appendError(err)
-			return &ChoiceBranchBuilder{builder: b, completed: 0}
-		}
-	default:
-		panic("Unsupported previous task:" + prevTask.String())
+
+	if err := b.chainToNext(choiceNode); err != nil {
+		b.appendError(err)
+		return &ChoiceBranchBuilder{builder: b, completed: 0}
 	}
 
 	b.prevNode = choiceNode
@@ -303,15 +293,11 @@ func (b *Builder) AddFailNodeAndBuild(errorName, errorMessage string) (*Workflow
 	failNode := NewFailureTask(errorName, errorMessage)
 
 	b.workflow.add(failNode)
-	switch prevTask := b.prevNode.(type) {
-	case UnaryTask:
-		err := prevTask.SetNext(failNode)
-		if err != nil {
-			return nil, fmt.Errorf("failed to chain the Fail: %v", err)
-		}
-	default:
-		panic("Unsupported previous task:" + prevTask.String())
+
+	if err := b.chainToNext(failNode); err != nil {
+		return nil, fmt.Errorf("failed to chain the FailTask: %v", err)
 	}
+
 	b.prevNode = failNode
 	return b.Build()
 }
@@ -325,20 +311,20 @@ func (b *Builder) AddSucceedNodeAndBuild(message string) (*Workflow, error) {
 	succeedNode := NewSuccessTask()
 
 	b.workflow.add(succeedNode)
-	switch prevTask := b.prevNode.(type) {
-	case UnaryTask:
-		err := prevTask.SetNext(succeedNode)
-		if err != nil {
-			return nil, fmt.Errorf("failed to chain the SuccessTask: %v", err)
-		}
-	default:
-		panic("Unsupported previous task:" + prevTask.String())
+
+	if err := b.chainToNext(succeedNode); err != nil {
+		return nil, fmt.Errorf("failed to chain the SuccessTask: %v", err)
 	}
+
 	b.prevNode = succeedNode
 	return b.Build()
 }
 
 func (b *Builder) AddPassNode(result string) *Builder {
+	return b.AddPassNodeWithId(result, "")
+}
+
+func (b *Builder) AddPassNodeWithId(result string, id string) *Builder {
 	nErrors := len(b.errors)
 	if nErrors > 0 {
 		fmt.Printf("AddFunctionTask skipped, because of %d error(s) in builder\n", nErrors)
@@ -346,25 +332,88 @@ func (b *Builder) AddPassNode(result string) *Builder {
 	}
 
 	passNode := NewPassTask(result)
+	if id != "" {
+		passNode.Id = TaskId(id)
+	}
 
 	b.workflow.add(passNode)
-	switch prevTask := b.prevNode.(type) {
-	case UnaryTask:
-		err := prevTask.SetNext(passNode)
-		if err != nil {
-			b.appendError(err)
-			return b
-		}
-	default:
-		panic("Unsupported previous task:" + prevTask.String())
+
+	if err := b.chainToNext(passNode); err != nil {
+		b.appendError(err)
+		return b
 	}
 
 	b.prevNode = passNode
 	return b
 }
 
+// AddParallelNode connects a parallel node to the previous node
+func (b *Builder) AddParallelNode(branches []*Workflow, id string) *Builder {
+	nErrors := len(b.errors)
+	if nErrors > 0 {
+		fmt.Printf("AddParallelNode skipped, because of %d error(s) in builder\n", nErrors)
+		return b
+	}
+
+	parallelNode := NewParallelTask(make([]TaskId, 0))
+	if id != "" {
+		parallelNode.Id = TaskId(id)
+	}
+	b.workflow.add(parallelNode)
+
+	err := b.chainToNext(parallelNode)
+	if err != nil {
+		b.appendError(err)
+		return b
+	}
+
+	var branchEndNodes []Task
+
+	for _, branchWf := range branches {
+		if branchWf.IsEmpty() {
+			continue
+		}
+
+		startNextId := branchWf.Start.GetNext()
+		if startNextId != branchWf.End.GetId() {
+			startNextTask, _ := branchWf.Find(startNextId)
+			if startNextTask != nil {
+				_ = parallelNode.AddBranch(startNextTask)
+			}
+		}
+
+		// Copy all tasks in the main workflow
+		for _, task := range branchWf.Tasks {
+			if task.GetType() == Start || task.GetType() == End {
+				continue
+			}
+			b.workflow.add(task)
+
+			if t, ok := task.(UnaryTask); ok {
+				if t.GetNext() == branchWf.End.GetId() {
+					branchEndNodes = append(branchEndNodes, t)
+				}
+			}
+		}
+	}
+
+	b.prevNode = nil
+	b.fanInPredecessors = branchEndNodes
+
+	return b
+
+}
+
 // Build ends the single branch with an EndTask. If there is more than one branch, it panics!
 func (b *Builder) Build() (*Workflow, error) {
+	if len(b.fanInPredecessors) > 0 {
+		err := b.chainToNext(b.workflow.End)
+		if err != nil {
+			return nil, fmt.Errorf("failed to chain fan-in to end node: %v", err)
+		}
+		return &b.workflow, nil
+	}
+
 	switch typedTask := b.prevNode.(type) {
 	case nil:
 		return &b.workflow, nil
@@ -383,4 +432,35 @@ func (b *Builder) Build() (*Workflow, error) {
 
 func CreateEmptyWorkflow() (*Workflow, error) {
 	return NewBuilder().Build()
+}
+
+// chainToNext connects the new node to the workflow, handling both standard (1-to-1)
+// and Fan-In (N-to-1) connections from parallel branches
+func (b *Builder) chainToNext(newNode Task) error {
+	// Case 1: Fan-In scenario (N-to-1 connection).
+	// Links all terminal nodes of the preceding parallel branches to the new node.
+	if len(b.fanInPredecessors) > 0 {
+		for _, prev := range b.fanInPredecessors {
+			if p, ok := prev.(UnaryTask); ok {
+				err := p.SetNext(newNode)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		b.fanInPredecessors = nil
+		return nil
+	}
+
+	// Case 2: Standard execution (1-to-1 connection).
+	// Simply links the immediate predecessor to the new node.
+	if b.prevNode != nil {
+		if prev, ok := b.prevNode.(UnaryTask); ok {
+			return prev.SetNext(newNode)
+		} else {
+			panic("Unsupported previous task:" + b.prevNode.String())
+		}
+	}
+	return nil
 }

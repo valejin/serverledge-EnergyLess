@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/serverledge-faas/serverledge/internal/node"
 	"io"
+	"log"
+	"maps"
 	"net/http"
 	"sort"
 	"time"
 
-	"log"
+	"github.com/serverledge-faas/serverledge/internal/node"
 
 	"github.com/serverledge-faas/serverledge/internal/client"
 	"github.com/serverledge-faas/serverledge/internal/config"
@@ -117,6 +118,8 @@ func (wflow *Workflow) computePreviousTasks() {
 		switch typedTask := task.(type) {
 		case ConditionalTask:
 			nextTasks = typedTask.GetAlternatives()
+		case FanOutTask:
+			nextTasks = append(nextTasks, typedTask.GetBranches()...)
 		case UnaryTask:
 			nextTasks = append(nextTasks, typedTask.GetNext())
 		case *EndTask:
@@ -159,6 +162,8 @@ func Visit(workflow *Workflow, taskId TaskId, excludeEnd bool) []Task {
 		switch typedTask := task.(type) {
 		case ConditionalTask:
 			nextTasks = typedTask.GetAlternatives()
+		case FanOutTask:
+			nextTasks = append(nextTasks, typedTask.GetBranches()...)
 		case UnaryTask:
 			nextTasks = append(nextTasks, typedTask.GetNext())
 		case *EndTask:
@@ -192,38 +197,54 @@ func (wflow *Workflow) IsTaskEligibleForExecution(id TaskId, p *Progress) bool {
 	return true
 }
 
-func (wflow *Workflow) ExecuteTask(r *Request, taskToExecute TaskId, input *TaskData, progress *Progress) (*TaskData, error) {
-	var err error
+func (wflow *Workflow) ExecuteTask(r *Request, taskToExecute TaskId, input *TaskData, progress *Progress) (*TaskData, []TaskId, error) {
 	var outputData *TaskData
+	var nextTasks []TaskId
 
 	n, ok := wflow.Find(taskToExecute)
 	if !ok {
-		return nil, fmt.Errorf("failed to find task %s", n.GetId())
+		return nil, nextTasks, fmt.Errorf("failed to find task %s", n.GetId())
+	}
+
+	// Check if the current task defines any pre-processing operations.
+	// If present, execute them immediately to mutate the input data before the task execution begins.
+	if ops := n.GetPreProcessors(); len(ops) > 0 {
+		err := ApplyPreProcessors(input, ops)
+		if err != nil {
+			r.mu.Lock()
+			progress.Fail(n.GetId())
+			r.mu.Unlock()
+			return nil, nextTasks, fmt.Errorf("failed to pre-process data for task %s: %w", n.GetId(), err)
+		}
 	}
 
 	switch task := n.(type) {
 	case UnaryTask:
 		output, err := task.execute(input, r)
+
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
 		if err != nil {
 			progress.Fail(n.GetId())
-			return nil, err
+			return nil, nextTasks, err
 		}
 
 		outputData = NewTaskData(output)
-		progress.Complete(task.GetId())
+		//progress.Complete(task.GetId())
 
 		nextTask := task.GetNext()
-		if wflow.IsTaskEligibleForExecution(nextTask, progress) {
-			progress.ReadyToExecute = append(progress.ReadyToExecute, nextTask)
-		} else {
-			fmt.Printf("task %s complete, but %s not eligible for execution", task.GetId(), nextTask)
-		}
+		nextTasks = append(nextTasks, nextTask)
 
 	case ConditionalTask:
 		nextTaskId, err := task.Evaluate(input, r)
+
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
 		if err != nil {
 			progress.Fail(n.GetId())
-			return nil, err
+			return nil, nextTasks, err
 		}
 
 		// we skip all tasks that will not be executed
@@ -243,27 +264,30 @@ func (wflow *Workflow) ExecuteTask(r *Request, taskToExecute TaskId, input *Task
 		for _, t := range toSkip {
 			progress.Skip(t.GetId())
 		}
-		progress.Complete(task.GetId())
+		//progress.Complete(task.GetId())
 
 		outputData = NewTaskData(input.Data)
-		if wflow.IsTaskEligibleForExecution(nextTaskId, progress) {
-			progress.ReadyToExecute = append(progress.ReadyToExecute, nextTaskId)
-		}
+		nextTasks = append(nextTasks, nextTaskId)
 
 		// Update metrics, if enabled
 		if metrics.Enabled {
 			metrics.AddBranchCount(string(task.GetId()), string(nextTaskId))
 		}
+	case FanOutTask:
+		outputData = NewTaskData(input.Data)
+
+		for _, nextTask := range task.GetBranches() {
+			nextTasks = append(nextTasks, nextTask)
+		}
+
 	case *EndTask:
-		progress.Complete(task.GetId())
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		//progress.Complete(task.GetId())
 		outputData = input
 	}
-	if err != nil {
-		progress.Fail(n.GetId())
-		return nil, err
-	}
 
-	return outputData, nil
+	return outputData, nextTasks, nil
 }
 
 // GetUniqueFunctions returns a list with the function names used in the Workflow. The returned function names are unique and in alphabetical order
@@ -381,27 +405,27 @@ func (wflow *Workflow) Save() error {
 	return nil
 }
 
-func (wflow *Workflow) initializeOrRetrieveProgress(r *Request) (*Progress, bool, error) {
+// initializeOrRetrieveProgress initializes the progress object if it is a new workflow request or retrieves it from a resuming workflow request.
+func (wflow *Workflow) initializeOrRetrieveProgress(r *Request) *Progress {
 	var progress *Progress
-	var err error
 	requestId := ReqId(r.Id)
 
 	if !r.Resuming {
 		progress = InitProgress(requestId, wflow)
-		return progress, false, nil
+		return progress
 	} else {
-		progress, err = RetrieveProgress(requestId)
-		if err != nil {
-			return nil, true, fmt.Errorf("failed to retrieve wflow progress: %v", err)
-		}
-		return progress, true, nil
+		progress = &r.Progress
+		return progress
 	}
 }
 
-func (wflow *Workflow) savePartialDataForReadyTasks(requestId ReqId, progress *Progress, data map[TaskId]*TaskData) error {
+func (wflow *Workflow) savePartialDataForReadyTasks(r *Request, requestId ReqId, progress *Progress, data map[TaskId]*TaskData) error {
 	handledTasks := make(map[TaskId]bool)
+	outputData := make(map[TaskId]TaskData)
 
-	for _, task := range progress.ReadyToExecute {
+	tasksToSave := append(progress.ReadyToExecute, r.NextTasksNotEligible...)
+
+	for _, task := range tasksToSave {
 		for _, prev := range wflow.GetPreviousTasks(task) {
 			if _, found := handledTasks[prev]; found {
 				continue
@@ -409,36 +433,65 @@ func (wflow *Workflow) savePartialDataForReadyTasks(requestId ReqId, progress *P
 
 			dataToSave, ok := data[prev]
 			if ok {
-				err := dataToSave.Save(requestId, prev)
-				if err != nil {
-					return fmt.Errorf("Could not save partial data: %v", err)
-				}
+				outputData[prev] = *dataToSave
 			} else {
-				// PD not available locally; they might be on Etcd already...
+				// PD not available locally
 			}
 
 			handledTasks[prev] = true
 		}
 	}
 
+	r.OutputData = outputData
 	return nil
 }
 
+type taskResult interface {
+	TaskID() TaskId
+	Error() error
+}
+
+type localExecutionResult struct {
+	tid       TaskId
+	out       *TaskData
+	err       error
+	nextTasks []TaskId
+}
+
+func (l localExecutionResult) TaskID() TaskId { return l.tid }
+func (l localExecutionResult) Error() error   { return l.err }
+
+type offloadExecutionResult struct {
+	jobId                TaskId
+	err                  error
+	resultingProgress    Progress
+	executedPlan         []TaskId
+	nextTasksNotEligible []TaskId
+	outputData           map[TaskId]TaskData
+}
+
+func (o offloadExecutionResult) TaskID() TaskId { return o.jobId }
+func (o offloadExecutionResult) Error() error   { return o.err }
+
 // Invoke schedules each function of the workflow and invokes them
 func (wflow *Workflow) Invoke(r *Request) error {
+	//alwaysSaveProgress := config.GetBool(config.WORKFLOW_ALWAYS_SAVE_PROGRESS, false)
 
-	alwaysSaveProgress := config.GetBool(config.WORKFLOW_ALWAYS_SAVE_PROGRESS, false)
-
-	var err error
 	requestId := ReqId(r.Id)
+	var err error
 
-	progress, isProgressOnEtcd, err := wflow.initializeOrRetrieveProgress(r)
-	if err != nil {
-		return err
-	}
+	progress := wflow.initializeOrRetrieveProgress(r)
 
 	// Initialize map of TaskData
 	dataMap := make(map[TaskId]*TaskData)
+
+	// Retrieve input data from the request for tasks ready to execute (resuming workflow)
+	if r.InitialData != nil {
+		for task, data := range r.InitialData {
+			dataMap[task] = &data
+		}
+		log.Printf("[Rq-%v] Injected %d pre-loaded task data from resume request", requestId, len(r.InitialData))
+	}
 
 	if len(progress.ReadyToExecute) == 0 {
 		return fmt.Errorf("[Rq-%v] wflow resumed but no task is ready for execution", requestId)
@@ -446,9 +499,36 @@ func (wflow *Workflow) Invoke(r *Request) error {
 
 	log.Printf("[Rq-%v] Starting/resuming execution (%d to executed)", requestId, len(progress.ReadyToExecute))
 
-	for len(progress.ReadyToExecute) > 0 {
+	localReadyChan := make(chan TaskId, len(wflow.Tasks))
+	resultChan := make(chan taskResult, len(wflow.Tasks))
+	dispatchSignalChan := make(chan struct{}, 1)
+
+	runningTasks := make(map[TaskId]bool)
+
+	var finalResultData *TaskData
+
+	// remoteNotEligible contains tasks evaluated as not eligible by a remote node.
+	var remoteNotEligible []TaskId
+
+	// Non-blocking trigger: signals the dispatcher or drops if a signal is already pending
+	triggerDispatch := func() {
+		select {
+		case dispatchSignalChan <- struct{}{}:
+		default:
+		}
+	}
+
+	// Evaluates policies and dispatches ready tasks
+	dispatchReadyTasks := func() error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		if len(progress.ReadyToExecute) == 0 {
+			return nil
+		}
+
 		t0 := time.Now()
-		decision, err := offloadingPolicy.Evaluate(r, progress) // qui chiama l'esecuzione del policy EnergyLess Alg.1
+		decisions, err := offloadingPolicy.Evaluate(r, progress, runningTasks)
 		policyTime := time.Since(t0).Seconds()
 		r.ExecReport.SchedulingTime += policyTime
 
@@ -456,124 +536,290 @@ func (wflow *Workflow) Invoke(r *Request) error {
 			return fmt.Errorf("an error occurred in policy evaluation: %v", err)
 		}
 
-		if decision.Offload || alwaysSaveProgress {
-			err := progress.Save()
-			if err != nil {
-				return fmt.Errorf("Could not save progress: %v", err)
-			}
-			isProgressOnEtcd = true
+		for _, decision := range decisions {
 
-			err = wflow.savePartialDataForReadyTasks(requestId, progress, dataMap)
-			if err != nil {
-				return fmt.Errorf("Could not save partial data: %v", err)
-			}
+			if decision.Offload {
 
+				var TasksToOffload []TaskId
+
+				// Filter the tasks in the offloading plan to include only those that are currently ready to execute
+				for _, plannedTask := range decision.OffloadingPlan.ToExecute {
+					idx := slices.Index(progress.ReadyToExecute, plannedTask)
+					if idx != -1 {
+						TasksToOffload = append(TasksToOffload, plannedTask)
+
+						// Remove the offloaded task directly from the slice
+						progress.ReadyToExecute = append(progress.ReadyToExecute[:idx], progress.ReadyToExecute[idx+1:]...)
+					}
+				}
+
+				// Skip offloading if there are no tasks actually ready
+				if len(TasksToOffload) == 0 {
+					continue
+				}
+
+				statusCopy := maps.Clone(progress.Status)
+
+				remoteProgress := Progress{
+					ReqId:          ReqId(r.Id),
+					Status:         statusCopy,
+					ReadyToExecute: TasksToOffload,
+				}
+
+				offloadJobId := TaskId(fmt.Sprintf("OFFLOAD_JOB_%v", TasksToOffload[0]))
+				runningTasks[offloadJobId] = true
+
+				dataToOffload := wflow.prepareOffloadData(decision, remoteProgress, dataMap)
+
+				go func(jobId TaskId, dec OffloadingDecision) {
+					resultingProgress, nextTasksNotEligible, outputData, errOffload := offload(r, &dec, remoteProgress, dataToOffload)
+
+					resultChan <- offloadExecutionResult{jobId: jobId, err: errOffload, resultingProgress: resultingProgress, executedPlan: dec.ToExecute, nextTasksNotEligible: nextTasksNotEligible, outputData: outputData}
+				}(offloadJobId, decision)
+
+				log.Printf("[Rq-%v] Offloading task dispatched remotely", requestId)
+			}
 		}
 
-		if decision.Offload {
-			err = offload(r, &decision)
-			if err != nil {
-				return err
+		var tasksToKeep []TaskId
+
+		// pick the next executable task
+		for _, task := range progress.ReadyToExecute {
+			// Task must be executed locally
+			if r.Plan == nil || slices.Contains(r.Plan.ToExecute, task) {
+				localReadyChan <- task
+				continue
 			}
 
-			if r.ExecReport.Result != nil {
-				// Workflow execution has completed on remote node
-				log.Printf("[Rq-%v] Workflow has completed on remote node", requestId)
-				return nil
-			}
+			//Task is addressed to the source node (required when the workflow runs on a remote node)
+			tasksToKeep = append(tasksToKeep, task)
+		}
 
-			progress, err = RetrieveProgress(requestId)
-			if err != nil {
-				return fmt.Errorf("Could not retrieve progress after offloading: %v", err)
-			}
+		progress.ReadyToExecute = tasksToKeep
 
-			log.Printf("[Rq-%v] Ready to execute after offloading: %v", requestId, progress.ReadyToExecute)
-		} else {
-			// pick next executable task
-			var taskToExecute TaskId = ""
-			for _, task := range progress.ReadyToExecute {
-				if r.Plan == nil || slices.Contains(r.Plan.ToExecute, task) {
-					taskToExecute = task
-				}
-			}
-			if taskToExecute == "" {
+		return nil
+	}
+
+	triggerDispatch()
+
+	for {
+		r.mu.Lock()
+		pendingTasks := len(progress.ReadyToExecute)
+		r.mu.Unlock()
+
+		if len(runningTasks) == 0 && len(localReadyChan) == 0 && len(dispatchSignalChan) == 0 && len(remoteNotEligible) == 0 {
+			if pendingTasks > 0 || (r.Resuming && len(r.NextTasksNotEligible) > 0) {
 				log.Printf("[Rq-%v] Workflow has not completed but there is nothing left to execute in the plan", requestId)
 				break
 			}
 
+			if finalResultData != nil {
+				r.ExecReport.Result = finalResultData.Data
+			}
+
+			log.Printf("[Rq-%v] Workflow completed", requestId)
+
+			err = DeleteAllTaskData(requestId)
+			if err != nil {
+				log.Printf("Failed to delete task data: %v", err)
+			}
+
+			return nil
+		}
+
+		select {
+		case <-dispatchSignalChan:
+
+			if err = dispatchReadyTasks(); err != nil {
+				return err
+			}
+
+		case taskToExecute := <-localReadyChan:
+
+			r.mu.Lock()
+
 			log.Printf("[Rq-%v] Now going to execute %s", requestId, taskToExecute)
 
-			// Prepare input for taskToExecute
 			var input *TaskData
-			if wflow.Tasks[taskToExecute].GetType() == Start {
-				input = NewTaskData(r.Params)
-			} else {
-				var found bool
-				previousTasks := wflow.GetPreviousTasks(taskToExecute)
-				for _, previousTask := range previousTasks {
-					if progress.Status[previousTask] == Skipped {
-						continue
-					}
 
-					if input != nil {
-						return fmt.Errorf("merge of inputs not supported yet!")
-					}
-
-					input, found = dataMap[previousTask]
-					if !found {
-						input, err = RetrievePartialData(requestId, previousTask)
-						if err != nil {
-							return fmt.Errorf("could not retrieve partial data: %v", err)
-						}
-					}
-				}
+			input, err = wflow.prepareInput(taskToExecute, progress, dataMap, r)
+			if err != nil {
+				r.mu.Unlock()
+				return err
 			}
+
+			runningTasks[taskToExecute] = true
+
+			r.mu.Unlock()
 
 			if input == nil {
 				log.Printf("Nil input for task: %s", taskToExecute)
 			}
-			output, err := wflow.ExecuteTask(r, taskToExecute, input, progress)
-			if err != nil {
-				if errors.Is(err, node.OutOfResourcesErr) {
-					log.Printf("[Rq-%v] Could not execute %s: out of resources", requestId, taskToExecute)
-					return err
+
+			var actualInput *TaskData
+			if input != nil {
+				actualInput = NewTaskData(maps.Clone(input.Data))
+			}
+
+			go func(t TaskId, in *TaskData) {
+				out, nextTasks, execErr := wflow.ExecuteTask(r, t, in, progress)
+
+				resultChan <- localExecutionResult{tid: t, out: out, err: execErr, nextTasks: nextTasks}
+			}(taskToExecute, actualInput)
+
+		case res := <-resultChan:
+
+			r.mu.Lock()
+			delete(runningTasks, res.TaskID())
+			r.mu.Unlock()
+
+			if res.Error() != nil {
+				if errors.Is(res.Error(), node.OutOfResourcesErr) {
+					log.Printf("[Rq-%v] Could not execute %s: out of resources", requestId, res.TaskID())
+					return res.Error()
 				} else {
-					return fmt.Errorf("failed wflow execution: %v", err)
+					return fmt.Errorf("failed wflow execution: %v", res.Error())
 				}
 			}
 
-			log.Printf("[Rq-%v] Executed %s", requestId, taskToExecute)
+			var shouldDispatch bool
 
-			dataMap[taskToExecute] = output
+			r.mu.Lock()
+			switch result := res.(type) {
 
-			if len(progress.ReadyToExecute) == 0 && output != nil {
-				r.ExecReport.Result = output.Data
+			case offloadExecutionResult:
 
-				log.Printf("[Rq-%v] Workflow completed", requestId)
+				log.Printf("[Rq-%v] Remote offloading completed id: %v", requestId, result.jobId)
 
-				if isProgressOnEtcd {
-					err = DeleteProgress(requestId)
-					if err != nil {
-						log.Printf("Failed to delete progress: %v", err)
-					}
-					err = DeleteAllTaskData(requestId)
-					if err != nil {
-						log.Printf("Failed to delete task data: %v", err)
+				remoteProgress := result.resultingProgress
+				nextNotEligible := result.nextTasksNotEligible
+
+				// Merge the data retrieved from the remote node into the local map
+				for taskId, taskData := range result.outputData {
+					tData := taskData
+					dataMap[taskId] = &tData
+				}
+
+				finalResultData = nil
+
+				//Update status only for tasks executed in the offload request
+				for _, task := range result.executedPlan {
+					if progress.Status[task] == Pending {
+						progress.Status[task] = remoteProgress.Status[task]
+
+						if _, isChoice := wflow.Tasks[task].(*ChoiceTask); isChoice && progress.Status[task] == Executed {
+							for remoteTask, remoteStatus := range remoteProgress.Status {
+								if remoteStatus == Skipped && progress.Status[remoteTask] == Pending {
+									progress.Status[remoteTask] = Skipped
+								}
+							}
+						}
 					}
 				}
 
-				return nil
+				// Merge the ready tasks returned by the remote node into the local queue
+				for _, remoteTask := range remoteProgress.ReadyToExecute {
+					if !slices.Contains(progress.ReadyToExecute, remoteTask) {
+						progress.ReadyToExecute = append(progress.ReadyToExecute, remoteTask)
+					}
+				}
+
+				for _, remote := range nextNotEligible {
+					// Check if the task is now eligible for execution
+					if wflow.IsTaskEligibleForExecution(remote, progress) {
+						for i, task := range remoteNotEligible {
+							if task == remote {
+								// Remove the task from the list of not eligible tasks
+								remoteNotEligible = append(remoteNotEligible[:i], remoteNotEligible[i+1:]...)
+							}
+						}
+						// Append the task to the list of ready tasks
+						progress.ReadyToExecute = append(progress.ReadyToExecute, remote)
+					} else {
+						if !slices.Contains(remoteNotEligible, remote) {
+							// Append the task to the list of not eligible tasks if it is not already there
+							remoteNotEligible = append(remoteNotEligible, remote)
+						}
+					}
+				}
+
+				// Check if any previously not eligible tasks were completed during the offload request
+				for i, notEligible := range remoteNotEligible {
+					if progress.Status[notEligible] != Pending {
+						remoteNotEligible = append(remoteNotEligible[:i], remoteNotEligible[i+1:]...)
+					}
+				}
+
+				if r.ExecReport.Result != nil {
+					log.Printf("[Rq-%v] Workflow has completed on remote node", requestId)
+				}
+
+				shouldDispatch = len(progress.ReadyToExecute) > 0
+				r.mu.Unlock()
+
+			case localExecutionResult:
+
+				log.Printf("[Rq-%v] Executed locally: %s", requestId, result.tid)
+
+				progress.Complete(result.tid)
+
+				// Check if any previously not eligible tasks were completed during the local execution
+				for i, nid := range remoteNotEligible {
+					if nid == result.tid {
+						remoteNotEligible = append(remoteNotEligible[:i], remoteNotEligible[i+1:]...)
+						break
+					}
+				}
+
+				// If running as an offloaded worker,
+				// ensure the completed task is removed from the non-eligible list before returning the report to the coordinator.
+				if r.Resuming {
+					for i, nid := range r.NextTasksNotEligible {
+						if nid == result.tid {
+							r.NextTasksNotEligible = append(r.NextTasksNotEligible[:i], r.NextTasksNotEligible[i+1:]...)
+							break
+						}
+					}
+				}
+
+				// tasksToExecute contains all next tasks of the just executed task (both eligible and not eligible)
+				for _, nextTask := range result.nextTasks {
+					if nextTask == "" {
+						continue
+					}
+					if r.Resuming && !wflow.IsTaskEligibleForExecution(nextTask, progress) {
+						if !slices.Contains(r.NextTasksNotEligible, nextTask) {
+							r.NextTasksNotEligible = append(r.NextTasksNotEligible, nextTask)
+						}
+					} else {
+						if wflow.IsTaskEligibleForExecution(nextTask, progress) {
+							progress.ReadyToExecute = append(progress.ReadyToExecute, nextTask)
+						}
+					}
+				}
+
+				if result.out != nil {
+					// Save the output in the local map
+					dataMap[result.tid] = result.out
+
+					finalResultData = result.out
+				}
+
+				shouldDispatch = len(progress.ReadyToExecute) > 0
+				r.mu.Unlock()
+			}
+
+			// After processing a result, new tasks may have been added to the readyToExecute queue.
+			// The dispatcher is then triggered again.
+			if shouldDispatch {
+				triggerDispatch()
 			}
 		}
-
 	}
 
-	if len(progress.ReadyToExecute) > 0 {
-		err = progress.Save()
-		if err != nil {
-			return err
-		}
-		err = wflow.savePartialDataForReadyTasks(requestId, progress, dataMap)
+	// Save partial data for tasks assigned to remote nodes, ensuring distributed execution can proceed.
+	if len(progress.ReadyToExecute) > 0 || len(r.NextTasksNotEligible) > 0 {
+		err = wflow.savePartialDataForReadyTasks(r, requestId, progress, dataMap)
 		if err != nil {
 			return fmt.Errorf("Could not save partial data: %v", err)
 		}
@@ -582,9 +828,9 @@ func (wflow *Workflow) Invoke(r *Request) error {
 	return nil
 }
 
-func offload(r *Request, policyDecision *OffloadingDecision) error {
+func offload(r *Request, policyDecision *OffloadingDecision, progress Progress, data map[TaskId]TaskData) (Progress, []TaskId, map[TaskId]TaskData, error) {
 
-	log.Printf("[Rq-%v] Offloading decision: %v", r.Id, policyDecision)
+	log.Printf("[Rq-%v] Offloading decision: %v", r.Id, progress.ReadyToExecute)
 
 	request := WorkflowInvocationResumeRequest{
 		ReqId: r.Id,
@@ -594,7 +840,9 @@ func offload(r *Request, policyDecision *OffloadingDecision) error {
 			Async:           false, // we force a synchronous request
 			QoS:             r.QoS,
 		},
-		Plan: policyDecision.OffloadingPlan,
+		Plan:     policyDecision.OffloadingPlan,
+		Progress: progress,
+		Data:     data,
 	}
 
 	// Update slack for deadline satisfaction
@@ -602,7 +850,7 @@ func offload(r *Request, policyDecision *OffloadingDecision) error {
 
 	invocationBody, err := json.Marshal(request)
 	if err != nil {
-		return fmt.Errorf("JSON marshaling failed: %v", err)
+		return Progress{}, nil, nil, fmt.Errorf("JSON marshaling failed: %v", err)
 	}
 
 	// Send invocation request
@@ -610,26 +858,28 @@ func offload(r *Request, policyDecision *OffloadingDecision) error {
 	resp, err := utils.PostJson(url, invocationBody)
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
-			return node.OutOfResourcesErr
+			return Progress{}, nil, nil, node.OutOfResourcesErr
 		} else {
-			return fmt.Errorf("HTTP request for offloading failed: %v", err)
+			return Progress{}, nil, nil, fmt.Errorf("HTTP request for offloading failed: %v", err)
 		}
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed offloaded workflow: %v", err)
+		return Progress{}, nil, nil, fmt.Errorf("failed offloaded workflow: %v", err)
 	}
 
 	var response InvocationResponse
 	body, _ := io.ReadAll(resp.Body)
 	err = json.Unmarshal(body, &response)
 	if err != nil {
-		return fmt.Errorf("Failed InvocationResponse unmarshaling: %v", err)
+		return Progress{}, nil, nil, fmt.Errorf("Failed InvocationResponse unmarshaling: %v", err)
 	}
 
 	if !response.Success {
-		return fmt.Errorf("failed offloaded workflow: %v", err)
+		return Progress{}, nil, nil, fmt.Errorf("failed offloaded workflow: %v", err)
 	}
+
+	r.mu.Lock()
 
 	for k, v := range response.Reports {
 		r.ExecReport.Reports[k] = v
@@ -644,7 +894,37 @@ func offload(r *Request, policyDecision *OffloadingDecision) error {
 		r.ExecReport.Result = response.Result
 	}
 
-	return nil
+	r.mu.Unlock()
+
+	return response.ResumeData.ResultingProgress, response.ResumeData.NextTasksNotEligible, response.ResumeData.OutputData, nil
+}
+
+// prepareOffloadData collects the input data needed for the tasks to be offloaded
+// by retrieving the outputs of their predecessor tasks.
+func (wflow *Workflow) prepareOffloadData(plan OffloadingDecision, progress Progress, data map[TaskId]*TaskData) map[TaskId]TaskData {
+	dataToOffload := make(map[TaskId]TaskData)
+	handledTasks := make(map[TaskId]bool)
+
+	for _, task := range plan.ToExecute {
+		for _, prev := range wflow.GetPreviousTasks(task) {
+			if _, found := handledTasks[prev]; found {
+				continue
+			}
+
+			if progress.Status[prev] == Executed {
+				dataToSave, ok := data[prev]
+				if ok {
+					dataToOffload[prev] = *dataToSave
+				} else {
+					// PD not available locally;
+				}
+			}
+
+			handledTasks[prev] = true
+		}
+	}
+
+	return dataToOffload
 }
 
 // Delete removes the Workflow from cache and from etcd, so it cannot be invoked anymore
@@ -819,6 +1099,13 @@ func (wflow *Workflow) decodeTask(taskId string, value json.RawMessage) error {
 			wflow.Tasks[TaskId(taskId)] = task
 			return nil
 		}
+	case Parallel:
+		task := &ParallelTask{}
+		err = json.Unmarshal(value, task)
+		if err == nil && task.Id != "" && len(task.Branches) > 0 {
+			wflow.Tasks[TaskId(taskId)] = task
+			return nil
+		}
 	default:
 		err = json.Unmarshal(value, task)
 		if err == nil && task.GetId() != "" {
@@ -878,4 +1165,95 @@ func findNextOrTerminate(state asl.CanEnd, sm *asl.StateMachine) (asl.State, str
 		nextState = sm.States[nextStateName]
 	}
 	return nextState, nextStateName, isTerminal
+}
+
+// prepareInput resolves and prepares the input TaskData for a given task before its execution.
+func (wflow *Workflow) prepareInput(taskToExecute TaskId, progress *Progress, dataMap map[TaskId]*TaskData, r *Request) (*TaskData, error) {
+	task, ok := wflow.Tasks[taskToExecute]
+	if !ok || task == nil {
+		return nil, fmt.Errorf("task '%s' does not exist", taskToExecute)
+	}
+
+	if task.GetType() == Start {
+		return NewTaskData(r.Params), nil
+	}
+
+	previousTasks := wflow.GetPreviousTasks(taskToExecute)
+	var prevTasks []TaskId
+	for _, previousTask := range previousTasks {
+		if progress.Status[previousTask] != Skipped {
+			prevTasks = append(prevTasks, previousTask)
+		}
+	}
+
+	// Case 1: Multiple predecessors (logical Fan-In)
+	if len(prevTasks) > 1 {
+		mergedResult := make(map[string]interface{})
+		parallelResults := make([]interface{}, len(prevTasks))
+
+		for i, prevTask := range prevTasks {
+
+			in, found := dataMap[prevTask]
+			if !found {
+				return nil, fmt.Errorf("partial data not found for task %s", prevTask)
+			} else {
+				log.Printf("[Rq-%v] Data found locally for task %v", r.Id, prevTask)
+			}
+			parallelResults[i] = in.Data
+		}
+
+		mergedResult["parallel_results"] = parallelResults
+
+		currentTask, ok := wflow.Find(taskToExecute)
+		if !ok {
+			return nil, fmt.Errorf("failed to find next task %s", taskToExecute)
+		}
+
+		fTask, isFunc := currentTask.(*FunctionTask)
+		if !isFunc {
+			return NewTaskData(mergedResult), nil
+		}
+
+		funct, exists := function.GetFunction(fTask.Func)
+		if !exists || funct.Signature == nil {
+			return NewTaskData(mergedResult), nil
+		}
+
+		delete(mergedResult, "parallel_results")
+
+		expectedInputs := funct.Signature.GetInputs()
+
+		// Create a map of the expected inputs for name-based matching
+		expectedMap := make(map[string]bool)
+		for _, input := range expectedInputs {
+			expectedMap[input.Name] = true
+		}
+
+		// Extract and assign values based on key names, regardless of position
+		for _, res := range parallelResults {
+			if resMap, ok := res.(map[string]interface{}); ok {
+				for key, val := range resMap {
+					if expectedMap[key] {
+						mergedResult[key] = val
+					}
+				}
+			}
+		}
+
+		return NewTaskData(mergedResult), nil
+	}
+
+	// Case 2: single predecessor
+	if len(prevTasks) == 1 {
+		previousTask := prevTasks[0]
+		input, found := dataMap[previousTask]
+		if !found {
+			return nil, fmt.Errorf("partial data not found for task %s", previousTask)
+		} else {
+			log.Printf("[Rq-%v] Data found locally for task %v", r.Id, previousTask)
+		}
+		return input, nil
+	}
+
+	return nil, fmt.Errorf("no valid predecessor for %s", taskToExecute)
 }

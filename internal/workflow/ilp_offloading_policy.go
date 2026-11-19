@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/serverledge-faas/serverledge/internal/config"
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/serverledge-faas/serverledge/internal/config"
 )
 
 type IlpOffloadingPolicy struct{}
@@ -15,12 +16,12 @@ type IlpOffloadingPolicy struct{}
 func (policy *IlpOffloadingPolicy) Init() {
 }
 
-func (policy *IlpOffloadingPolicy) Evaluate(r *Request, p *Progress) (OffloadingDecision, error) {
+func (policy *IlpOffloadingPolicy) Evaluate(r *Request, p *Progress, runningTasks map[TaskId]bool) ([]OffloadingDecision, error) {
 
 	completed := 0
 
 	if p == nil || !r.CanDoOffloading || len(p.ReadyToExecute) == 0 {
-		return OffloadingDecision{Offload: false}, nil
+		return []OffloadingDecision{{Offload: false}}, nil
 	}
 
 	for _, s := range p.Status {
@@ -30,12 +31,24 @@ func (policy *IlpOffloadingPolicy) Evaluate(r *Request, p *Progress) (Offloading
 	}
 
 	if completed > 0 {
-		placement, found := getCachedSolution(r)
-		if found {
-			log.Printf("Reusing cached placement\n")
-			return computeDecisionFromPlacement(*placement, p, r), nil
+		placement, isValid, exists := getCachedSolution(r)
+		if exists {
+			if isValid {
+				// TTL > 0
+				log.Printf("Reusing cached placement\n")
+				return ComputeDecisionFromPlacement(*placement, p, r), nil
+				// TTL == 0 but there are running tasks, so the placement cannot be recalculated
+			} else if len(runningTasks) > 0 {
+				log.Printf("Cache TTL expired for %s, but system is busy (%d running tasks). Reusing previous placement.\n", r.W.Name, len(runningTasks))
+				return ComputeDecisionFromPlacement(*placement, p, r), nil
+			}
+		} else if len(runningTasks) > 0 {
+			log.Printf("No placement found and system is busy. Defaulting to local execution.\n")
+			return []OffloadingDecision{{Offload: false}}, nil
 		}
 	}
+
+	log.Printf("System at rest. Calculating optimal placement for %s.\n", r.W.Name)
 
 	params := prepareParameters(r, p)
 
@@ -53,7 +66,7 @@ func (policy *IlpOffloadingPolicy) Evaluate(r *Request, p *Progress) (Offloading
 	url := fmt.Sprintf("http://%s:%d/ilp", ilpOptimizerHost, ilpOptimizerPort)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return OffloadingDecision{Offload: false}, fmt.Errorf("creating request: %w", err)
+		return []OffloadingDecision{{Offload: false}}, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
@@ -61,24 +74,24 @@ func (policy *IlpOffloadingPolicy) Evaluate(r *Request, p *Progress) (Offloading
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		fmt.Println(err)
-		return OffloadingDecision{Offload: false}, fmt.Errorf("sending request: %w", err)
+		return []OffloadingDecision{{Offload: false}}, fmt.Errorf("sending request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	statusCode := resp.StatusCode
 	if statusCode != 200 {
-		return OffloadingDecision{Offload: false}, fmt.Errorf("scheduling failed with status code %d", statusCode)
+		return []OffloadingDecision{{Offload: false}}, fmt.Errorf("scheduling failed with status code %d", statusCode)
 	}
 
 	solverTime := time.Since(t0)
 	log.Printf("solver time for %s: %v\n", r.W.Name, solverTime.Seconds())
 
 	// Read and print response
-	var placement taskPlacement
+	var placement TaskPlacement
 	err = json.NewDecoder(resp.Body).Decode(&placement)
 	if err != nil {
 		fmt.Println(err)
-		return OffloadingDecision{Offload: false}, fmt.Errorf("decoding response: %w", err)
+		return []OffloadingDecision{{Offload: false}}, fmt.Errorf("decoding response: %w", err)
 	}
 
 	defaultTTL := config.GetInt(config.WORKFLOW_OFFLOADING_POLICY_ILP_PLACEMENT_TTL, 2) - 1
@@ -96,5 +109,5 @@ func (policy *IlpOffloadingPolicy) Evaluate(r *Request, p *Progress) (Offloading
 	}
 
 	// parse results and make a decision
-	return computeDecisionFromPlacement(placement, p, r), nil
+	return ComputeDecisionFromPlacement(placement, p, r), nil
 }

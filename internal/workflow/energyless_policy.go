@@ -502,7 +502,7 @@ func (policy *EnergyLessPolicy) minAccuracyThreshold(r *Request) float64 {
 
 // Prende in input la richiesta attuale (Request) e lo stato di avanzamento (Progress) e
 // restituisce una decisione (OffloadingDecision) e un eventuale errore (error).
-func (policy *EnergyLessPolicy) Evaluate(r *Request, p *Progress) (OffloadingDecision, error) {
+func (policy *EnergyLessPolicy) evaluateSingle(r *Request, p *Progress) (OffloadingDecision, error) {
 	if p == nil || !r.CanDoOffloading || len(p.ReadyToExecute) == 0 {
 		return OffloadingDecision{Offload: false}, nil
 	}
@@ -536,6 +536,17 @@ func (policy *EnergyLessPolicy) Evaluate(r *Request, p *Progress) (OffloadingDec
 	}
 
 	return policy.computeDecisionFromPlacement(p, placement, r.Variants), nil
+}
+
+// Evaluate implementa l'interfaccia OffloadingPolicy introdotta con fork-join:
+// Invoke accetta più decisioni (una per destinazione remota) ed esegue in locale
+// tutti i task pronti non inclusi in una decisione di offload.
+func (policy *EnergyLessPolicy) Evaluate(r *Request, p *Progress, runningTasks map[TaskId]bool) ([]OffloadingDecision, error) {
+	d, err := policy.evaluateSingle(r, p)
+	if err != nil {
+		return nil, err
+	}
+	return []OffloadingDecision{d}, nil
 }
 
 // variantChoices ricava dal piano le sostituzioni "task -> variante": un task

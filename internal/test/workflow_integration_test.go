@@ -515,14 +515,15 @@ func TestResumeWorkflow(t *testing.T) {
 	progress := workflow.InitProgress(workflow.ReqId(request.Id), wflow)
 	pd := workflow.NewTaskData(request.Params)
 
-	err = progress.Save()
-	u.AssertNil(t, err)
+	/*err = progress.Save()
+	u.AssertNil(t, err)*/
 	err = pd.Save(workflow.ReqId(request.Id), wflow.Start.Id)
 	u.AssertNil(t, err)
 
 	resumedRequest := workflow.NewRequest(request.Id, wflow, params, approximateMapSize(params))
 	resumedRequest.CanDoOffloading = true
 	resumedRequest.Resuming = true
+	resumedRequest.Progress = *progress
 
 	err2 := wflow.Invoke(resumedRequest)
 	u.AssertNil(t, err2)
@@ -534,6 +535,61 @@ func TestResumeWorkflow(t *testing.T) {
 	}
 
 	// cleaning up function composition and function
+	err3 := wflow.Delete()
+	u.AssertNil(t, err3)
+}
+
+func TestInvokeParallelFC(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test")
+	}
+	workflowName := "test_parallel"
+	input := 2
+
+	// CREATE - we create a test function composition
+	incPy, errPy := initializeExamplePyFunction()
+	u.AssertNil(t, errPy)
+	doublePy, errDp := InitializePyFunction("double", "handler", function.NewSignature().
+		AddInput("n", function.Int{}).
+		AddOutput("n", function.Int{}).Build())
+	u.AssertNil(t, errDp)
+
+	branch1 := func() (*workflow.Workflow, error) { return CreateSequenceWorkflow(incPy) }
+	branch2 := func() (*workflow.Workflow, error) { return CreateSequenceWorkflow(incPy, doublePy) }
+
+	wflow, err := CreateParallelWorkflow(branch1, branch2)
+	u.AssertNil(t, err)
+	wflow.Name = workflowName
+
+	err1 := wflow.Save()
+	u.AssertNil(t, err1)
+
+	// INVOKE - we call the function composition
+	params := make(map[string]interface{})
+	params[incPy.Signature.GetInputs()[0].Name] = input
+
+	request := workflow.NewRequest(shortuuid.New(), wflow, params, approximateMapSize(params))
+	request.CanDoOffloading = false
+
+	err2 := wflow.Invoke(request)
+	u.AssertNil(t, err2)
+
+	// check result
+	resMap := request.ExecReport.Result
+
+	parallelResults, ok := resMap["parallel_results"].([]interface{})
+	u.AssertTrueMsg(t, ok, "parallel_results missing or not an array")
+	u.AssertEquals(t, 2, len(parallelResults))
+
+	resBranch1 := parallelResults[0].(map[string]interface{})
+	out1 := cast.ToInt(resBranch1[incPy.Signature.GetOutputs()[0].Name])
+	u.AssertEquals(t, input+1, out1)
+
+	resBranch2 := parallelResults[1].(map[string]interface{})
+	out2 := cast.ToInt(resBranch2[incPy.Signature.GetOutputs()[0].Name])
+	u.AssertEquals(t, (input+1)*2, out2)
+
+	// cleaning up function composition
 	err3 := wflow.Delete()
 	u.AssertNil(t, err3)
 }

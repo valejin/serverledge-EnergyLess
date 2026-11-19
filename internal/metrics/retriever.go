@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/serverledge-faas/serverledge/internal/registration"
 	"log"
 	"os"
 	"time"
+
+	"github.com/serverledge-faas/serverledge/internal/registration"
 
 	"github.com/prometheus/common/model"
 	"github.com/serverledge-faas/serverledge/internal/config"

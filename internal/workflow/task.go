@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+
 	"github.com/serverledge-faas/serverledge/internal/types"
 )
 
@@ -13,6 +14,8 @@ type Task interface {
 	GetId() TaskId
 
 	GetType() TaskType
+
+	GetPreProcessors() []DataOperation
 
 	fmt.Stringer
 	types.Comparable
@@ -36,9 +39,17 @@ type ConditionalTask interface {
 	Evaluate(data *TaskData, r *Request) (TaskId, error)
 }
 
+type FanOutTask interface {
+	Task
+	AddBranch(nextTask Task) error
+	GetBranches() []TaskId
+}
+
 type baseTask struct {
 	Id   TaskId
 	Type TaskType
+
+	PreProcessors []DataOperation
 }
 
 func (s *baseTask) GetId() TaskId {
@@ -56,4 +67,8 @@ func (s *baseTask) Equals(cmp types.Comparable) bool {
 	}
 
 	return s.Id == e2.GetId() && s.Type == e2.GetType()
+}
+
+func (b *baseTask) GetPreProcessors() []DataOperation {
+	return b.PreProcessors
 }

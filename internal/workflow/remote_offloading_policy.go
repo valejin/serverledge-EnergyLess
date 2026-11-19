@@ -2,7 +2,6 @@ package workflow
 
 import (
 	"encoding/json"
-	"github.com/serverledge-faas/serverledge/internal/node"
 	"log"
 	"math"
 	"net/http"
@@ -10,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/serverledge-faas/serverledge/internal/node"
 
 	"github.com/serverledge-faas/serverledge/internal/config"
 	"github.com/serverledge-faas/serverledge/internal/function"
@@ -23,13 +24,16 @@ type remotePolicyParams struct {
 	EdgeNodes           []string            `json:"edge_nodes"`            // Set of Edge nodes
 	NodeAvailableMemory map[string]float64  `json:"node_available_memory"` // Available memory per node
 	NodeFreeMemory      map[string]float64  `json:"node_free_memory"`      // Free memory per node
+	NodeAvailableCPUs   map[string]float64  `json:"node_available_cpus"`   // Available CPUs per node
 	DSLatency           map[string]float64  `json:"ds_latency"`            // Latency per node
 	DSBandwidth         map[string]float64  `json:"ds_bandwidth"`          // Bandwidth per node
 	NodeLatency         map[string]float64  `json:"node_latency"`          // map[json.dumps((src_node, dst_node))] = latency
+	NodeBandwidth       map[string]float64  `json:"node_bandwidth"`
 	HandlingNode        string              `json:"handling_node"`
 	T                   []string            `json:"T"`           // Set of tasks
 	Adj                 map[string][]string `json:"adj"`         // Task adjacency list
 	TaskMemory          map[string]float64  `json:"task_memory"` // Memory per task
+	TaskCPUs            map[string]float64  `json:"task_cpus"`   // CPUs per task
 	Deadline            float64             `json:"deadline"`    // Global deadline
 	OutputSize          map[string]float64  `json:"output_size"` // Output size per task
 	InputSize           float64             `json:"input_size"`  // Input data size
@@ -43,7 +47,7 @@ type remotePolicyParams struct {
 	InitTime map[string]float64 `json:"init_time"` // map[json.dumps((task, node))] = time
 }
 
-type taskPlacement map[TaskId]string
+type TaskPlacement map[TaskId]string
 
 func initParams() remotePolicyParams {
 	return remotePolicyParams{
@@ -53,13 +57,16 @@ func initParams() remotePolicyParams {
 		OutputSize:          make(map[string]float64),
 		NodeAvailableMemory: make(map[string]float64),
 		NodeFreeMemory:      make(map[string]float64),
+		NodeAvailableCPUs:   make(map[string]float64),
 		Cost:                make(map[string]float64),
 		TaskMemory:          make(map[string]float64),
+		TaskCPUs:            make(map[string]float64),
 		NodeLabels:          make(map[string][]string),
 		TaskLabels:          make(map[string][]string),
 		DSBandwidth:         make(map[string]float64),
 		DSLatency:           make(map[string]float64),
 		NodeLatency:         make(map[string]float64),
+		NodeBandwidth:       make(map[string]float64),
 		ObjWeights:          []float64{0.33, 0.33, 0.33},
 	}
 }
@@ -69,38 +76,41 @@ const CLOUD = "CLOUD"
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
 type cachedPlacement struct {
-	placement taskPlacement
+	placement TaskPlacement
 	ttl       int
 }
 
 var placementCacheMutex sync.Mutex = sync.Mutex{}
 var placementCache map[string]*cachedPlacement
 
-func getCachedSolution(r *Request) (*taskPlacement, bool) {
+// getCachedSolution returns the cached solution for the given request, if any.
+// If the solution is not cached, it returns nil, false, false.
+// If the solution is cached and valid, it returns the solution, true, true.
+// If the solution is cached but expired, it returns the solution, false, true.
+func getCachedSolution(r *Request) (*TaskPlacement, bool, bool) {
 	placementCacheMutex.Lock()
 	defer placementCacheMutex.Unlock()
 
 	if placementCache == nil {
 		placementCache = make(map[string]*cachedPlacement)
-		return nil, false
+		return nil, false, false
 	}
 
 	sol, ok := placementCache[r.Id]
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
 
 	// check TTL
-	if sol.ttl > 0 {
+	isValid := sol.ttl > 0
+	if isValid {
 		sol.ttl--
-		return &sol.placement, ok
 	}
 
-	delete(placementCache, r.Id)
-	return nil, false
+	return &sol.placement, isValid, true
 }
 
-func cacheSolution(r *Request, sol *taskPlacement, ttl int) {
+func cacheSolution(r *Request, sol *TaskPlacement, ttl int) {
 	placementCacheMutex.Lock()
 	defer placementCacheMutex.Unlock()
 
@@ -119,7 +129,6 @@ func tupleKey(s1, s2 string) string {
 	return string(keyBytes)
 }
 
-// TODO: Update this function as soon as tasks that split/merge their inputs are implemented (e.g., Map)
 func computeOutputSize(workflow *Workflow, inputParamsSize float64) map[string]float64 {
 
 	task := workflow.Start
@@ -131,7 +140,8 @@ func computeOutputSize(workflow *Workflow, inputParamsSize float64) map[string]f
 	outputSize := make(map[string]float64)
 	avgOutputSize := metrics.GetMetrics().AvgOutputSize
 
-	var currentInputSize = inputParamsSize
+	inputSizes := make(map[TaskId]float64)
+	inputSizes[task.GetId()] = inputParamsSize
 
 	for len(toVisit) > 0 {
 		task := toVisit[0]
@@ -139,12 +149,16 @@ func computeOutputSize(workflow *Workflow, inputParamsSize float64) map[string]f
 		toVisit = toVisit[1:]
 		visited[task.GetId()] = true
 
+		currentInputSize := inputSizes[task.GetId()]
 		var currentOutputSize float64
 
 		var nextTasks []TaskId
 		switch typedTask := task.(type) {
 		case ConditionalTask:
 			nextTasks = typedTask.GetAlternatives()
+			currentOutputSize = currentInputSize
+		case FanOutTask:
+			nextTasks = append(nextTasks, typedTask.GetBranches()...)
 			currentOutputSize = currentInputSize
 		case UnaryTask:
 			nextTasks = append(nextTasks, typedTask.GetNext())
@@ -162,6 +176,9 @@ func computeOutputSize(workflow *Workflow, inputParamsSize float64) map[string]f
 		outputSize[string(task.GetId())] = currentOutputSize
 
 		for _, nt := range nextTasks {
+			if _, exists := inputSizes[nt]; !exists {
+				inputSizes[nt] = currentOutputSize
+			}
 			if _, ok := visited[nt]; !ok {
 				nextTask, ok := workflow.Tasks[nt]
 				if ok {
@@ -171,8 +188,6 @@ func computeOutputSize(workflow *Workflow, inputParamsSize float64) map[string]f
 				}
 			}
 		}
-
-		currentInputSize = currentOutputSize
 	}
 
 	return outputSize
@@ -192,6 +207,7 @@ func prepareParameters(r *Request, p *Progress) *remotePolicyParams {
 	params.HandlingNode = LOCAL
 	params.NodeAvailableMemory[LOCAL] = (float64)(node.LocalResources.AvailableMemory())
 	params.NodeFreeMemory[LOCAL] = (float64)(node.LocalResources.FreeMemory())
+	params.NodeAvailableCPUs[LOCAL] = node.LocalResources.AvailableCPUs()
 
 	wViolations := config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ILP_OBJ_WEIGHT_VIOLATIONS, 0.3)
 	wDataTransfers := config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ILP_OBJ_WEIGHT_DATA_TRANSFERS, 0.3)
@@ -217,12 +233,15 @@ func prepareParameters(r *Request, p *Progress) *remotePolicyParams {
 				params.EdgeNodes = append(params.EdgeNodes, k)
 				params.NodeAvailableMemory[k] = float64(v.AvailableMemory)
 				params.NodeFreeMemory[k] = float64(v.FreeMemory)
+				params.NodeAvailableCPUs[k] = v.TotalCPU - v.UsedCPU
 
 				// Cost (assuming that Edge nodes are all in the same area)
 				params.Cost[k] = localCost
 			}
 		}
 	}
+
+	edgeToEdgeBandwidth := config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_EDGE_TO_EDGE_BANDWIDTH, 100.0)
 
 	// Compute distances
 	for key1, v1 := range nearbyServers {
@@ -233,6 +252,9 @@ func prepareParameters(r *Request, p *Progress) *remotePolicyParams {
 		distance = registration.VivaldiClient.DistanceTo(&v1.Coordinates).Seconds() / 2
 		params.NodeLatency[tupleKey(LOCAL, key1)] = distance
 		params.NodeLatency[tupleKey(key1, LOCAL)] = distance
+
+		params.NodeBandwidth[tupleKey(LOCAL, key1)] = edgeToEdgeBandwidth
+		params.NodeBandwidth[tupleKey(key1, LOCAL)] = edgeToEdgeBandwidth
 
 		for key2, v2 := range nearbyServers {
 			if !slices.Contains(params.EdgeNodes, key2) {
@@ -245,8 +267,13 @@ func prepareParameters(r *Request, p *Progress) *remotePolicyParams {
 			}
 			params.NodeLatency[tupleKey(key1, key2)] = distance
 			params.NodeLatency[tupleKey(key2, key1)] = distance
+
+			params.NodeBandwidth[tupleKey(key1, key2)] = edgeToEdgeBandwidth
+			params.NodeBandwidth[tupleKey(key2, key1)] = edgeToEdgeBandwidth
 		}
 	}
+
+	dsBandwidth := config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_NODE_TO_DATA_STORE_BANDWIDTH, 40.0)
 
 	if len(params.CloudNodes) > 0 {
 		// Cost
@@ -265,6 +292,9 @@ func prepareParameters(r *Request, p *Progress) *remotePolicyParams {
 
 			// TODO: we assume distance to Cloud == distance to DS (for all Edge nodes)
 			params.DSLatency[n] = distanceToCloud
+
+			params.NodeBandwidth[tupleKey(n, CLOUD)] = dsBandwidth
+			params.NodeBandwidth[tupleKey(CLOUD, n)] = dsBandwidth
 		}
 		params.NodeLatency[tupleKey(CLOUD, CLOUD)] = 0.0
 		params.DSLatency[CLOUD] = 0.001
@@ -276,7 +306,6 @@ func prepareParameters(r *Request, p *Progress) *remotePolicyParams {
 	}
 
 	// Bandwidth (we assume identical)
-	dsBandwidth := config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_NODE_TO_DATA_STORE_BANDWIDTH, 40.0)
 	for _, n := range params.EdgeNodes {
 		params.DSBandwidth[n] = dsBandwidth
 	}
@@ -409,6 +438,17 @@ func prepareParameters(r *Request, p *Progress) *remotePolicyParams {
 				params.Adj[string(tid)] = append(params.Adj[string(tid)], entry)
 			}
 			params.TaskMemory[string(tid)] = float64(10)
+			params.TaskCPUs[string(tid)] = 0.01
+
+		case FanOutTask:
+			for _, branchId := range typedTask.GetBranches() {
+				entry := tupleKey(string(branchId), "1.0")
+				params.Adj[string(tid)] = append(params.Adj[string(tid)], entry)
+			}
+
+			params.TaskMemory[string(tid)] = float64(10)
+			params.TaskCPUs[string(tid)] = 0.01
+
 		case UnaryTask:
 			nextTid := string(typedTask.GetNext())
 			entry := tupleKey(nextTid, "1.0")
@@ -418,12 +458,15 @@ func prepareParameters(r *Request, p *Progress) *remotePolicyParams {
 			if ok {
 				f, _ := function.GetFunction(ft.Func)
 				params.TaskMemory[string(tid)] = float64(f.MemoryMB)
+				params.TaskCPUs[string(tid)] = f.CPUDemand
 			} else {
 				params.TaskMemory[string(tid)] = float64(10)
+				params.TaskCPUs[string(tid)] = 0.01
 			}
 
 		default:
 			params.TaskMemory[string(tid)] = float64(10)
+			params.TaskCPUs[string(tid)] = 0.01
 		}
 
 	}
@@ -431,42 +474,59 @@ func prepareParameters(r *Request, p *Progress) *remotePolicyParams {
 	return &params
 }
 
-func computeDecisionFromPlacement(placement taskPlacement, p *Progress, r *Request) OffloadingDecision {
+func ComputeDecisionFromPlacement(placement TaskPlacement, p *Progress, r *Request) []OffloadingDecision {
+	localKey := registration.SelfRegistration.Key
 
-	var localExecution = false
-	var remoteNode string
+	nodeToTasks := make(map[string][]TaskId)
+	for t, assignedNode := range placement {
+		if p.Status[t] == Pending {
+			nodeToTasks[assignedNode] = append(nodeToTasks[assignedNode], t)
+		}
+	}
+
+	// Set the execution plan for the local node
+	r.Plan = &OffloadingPlan{ToExecute: nodeToTasks[localKey]}
+
+	readyRemoteNodes := make(map[string]bool)
 	for _, t := range p.ReadyToExecute {
 		assignedNode := placement[t]
-		if assignedNode == registration.SelfRegistration.Key {
-			localExecution = true
-			break
-		} else {
-			remoteNode = assignedNode
+		if assignedNode != localKey {
+			readyRemoteNodes[assignedNode] = true
 		}
 	}
 
-	if localExecution {
+	// An empty map implies all ready tasks are designated for local execution
+	if len(readyRemoteNodes) == 0 {
 		log.Println("Continuing with local execution")
-		return OffloadingDecision{Offload: false}
+		return []OffloadingDecision{{Offload: false}}
 	}
 
-	// Retrieve all tasks assigned to n
-	toExecute := make([]TaskId, 0)
-	for t, assignedNode := range placement {
-		if assignedNode == remoteNode {
-			toExecute = append(toExecute, t)
+	var decisions []OffloadingDecision
+
+	for remoteNode := range readyRemoteNodes {
+		var remoteNodeReg *registration.NodeRegistration
+		if remoteNode == CLOUD {
+			remoteNodeReg = registration.GetRemoteOffloadingTarget()
+		} else {
+			remoteNodeReg = registration.GetPeerFromKey(remoteNode)
 		}
+
+		if remoteNodeReg == nil {
+			log.Printf("Warning: Node %s not found in registry, skipping offload", remoteNode)
+			continue
+		}
+
+		// Assign all tasks to the remote node according to the placement
+		plan := OffloadingPlan{ToExecute: nodeToTasks[remoteNode]}
+
+		decision := OffloadingDecision{
+			Offload:        true,
+			RemoteHost:     remoteNodeReg.APIUrl(),
+			OffloadingPlan: plan,
+		}
+
+		decisions = append(decisions, decision)
 	}
 
-	plan := OffloadingPlan{ToExecute: toExecute}
-
-	var remoteNodeReg *registration.NodeRegistration
-	if remoteNode == CLOUD {
-		remoteNodeReg = registration.GetRemoteOffloadingTarget()
-	} else {
-		remoteNodeReg = registration.GetPeerFromKey(remoteNode)
-	}
-
-	decision := OffloadingDecision{true, remoteNodeReg.APIUrl(), plan}
-	return decision
+	return decisions
 }

@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/serverledge-faas/serverledge/internal/config"
 	"log"
 	"os"
 	"time"
+
+	"github.com/serverledge-faas/serverledge/internal/config"
 
 	"github.com/serverledge-faas/serverledge/internal/node"
 

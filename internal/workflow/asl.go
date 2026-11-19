@@ -48,7 +48,7 @@ func buildingLoop(sm *asl.StateMachine, nextState asl.State, nextStateName strin
 			parallelState := nextState.(*asl.ParallelState)
 			b, err := BuildFromParallelState(builder, parallelState, nextStateName)
 			if err != nil {
-				return nil, fmt.Errorf("failed building FanInTask and FanOutTask from ParallelState: %v", err)
+				return nil, fmt.Errorf("failed building ParallelTask from Parallel state: %v", err)
 			}
 			builder = b
 			nextState, nextStateName, isTerminal = findNextOrTerminate(parallelState, sm)
@@ -104,6 +104,22 @@ func BuildFromTaskState(builder *Builder, t *asl.TaskState, name string) (*Build
 		return nil, fmt.Errorf("non existing function in workflow: %s", t.Resource)
 	}
 	builder = builder.AddFunctionTaskWithId(f, name)
+
+	if ft, ok := builder.prevNode.(*FunctionTask); ok {
+
+		inputPathStr := string(t.InputPath)
+		if inputPathStr != "" && inputPathStr != "$" {
+
+			op := DataOperation{
+				OpType: "JSONPathFilter",
+				Value:  inputPathStr,
+			}
+
+			// Append the data operation to the task's pre-processors chain
+			ft.PreProcessors = append(ft.PreProcessors, op)
+		}
+	}
+
 	return builder, nil
 }
 
@@ -313,9 +329,28 @@ func GetBranchForChoiceFromStates(sm *asl.StateMachine, nextState string, branch
 	return buildingLoop(sm, sm.States[nextState], nextState)
 }
 
-// BuildFromParallelState adds a FanOutTask and a FanInTask and as many branches as defined in the ParallelState
+// BuildFromParallelState adds a ParallelTask and as many branches as defined in the ParallelState
 func BuildFromParallelState(builder *Builder, c *asl.ParallelState, name string) (*Builder, error) {
-	// TODO: implement me
+	branches := make([]*Workflow, 0)
+
+	for i, branchSM := range c.Branches {
+		branchStartName := branchSM.StartAt
+		branchStartState := branchSM.States[branchStartName]
+
+		// Invoke buildingLoop recursively to build the sub-workflow
+		branchWflow, err := buildingLoop(branchSM, branchStartState, branchStartName)
+		if err != nil {
+			builder.appendError(err)
+			return builder, err
+		}
+
+		// Assign a unique name to the sub-workflow
+		branchWflow.Name = fmt.Sprintf("%s_branch_%d", name, i)
+		branches = append(branches, branchWflow)
+	}
+
+	// Add the ParallelTask that will contain all valid sub-workflows
+	builder.AddParallelNode(branches, name)
 	return builder, nil
 }
 
