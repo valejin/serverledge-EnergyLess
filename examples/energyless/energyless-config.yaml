@@ -42,9 +42,22 @@ default.init.time: 0.5
 # cartella da cui si avvia il nodo.
 tuning.file: "examples/energyless/tuning-energyless.yaml"
 
-# Costi di trasferimento (Eq. 14) e di storage (Eq. 15) verso il data store,
-# per byte. Default 0.0 (termini di costo azzerati). Valori >= 0.
+# Numero di core di un nodo cloud. L'energia di esecuzione di una funzione è
+# potenza di UN core x tempo (ogni funzione usa 1 core), con potenza di un
+# core = consumption.processing.power / numero di core del nodo. Per i nodi
+# edge il numero di core è pool.cpus (locale) o TotalCPU dell'heartbeat
+# (vicini); il cloud non lo comunica, quindi si indica qui. Default 1
+# (potenza del nodo intera per funzione). Valore > 0.
+cloud.cores: 1
+
+# Costo di trasferimento dei dati (Eq. 14), per byte e per tratta. I dati
+# passano direttamente tra nodi (nella richiesta HTTP di offloading e nella
+# sua risposta): cloud2datastore.transfer.cost vale per le tratte che toccano
+# il cloud, node2datastore.transfer.cost per quelle tra nodi edge. Default 0.0.
+# I costi di storage (Eq. 15) sono ancora accettati ma ignorati: non c'è più un
+# data store. Banda delle tratte: chiavi del file principale
+# workflow.offloading.policy.edge_to_edge_bandwidth (tra nodi edge, default
+# 100 Mbps) e workflow.offloading.policy.node2datastore.bandwidth (tra un nodo
+# edge e il cloud, default 40 Mbps), come nella RemoteOffloadingPolicy.
 node2datastore.transfer.cost: 0.0
 cloud2datastore.transfer.cost: 0.0
-node2datastore.storage.cost: 0.0
-cloud2datastore.storage.cost: 0.0

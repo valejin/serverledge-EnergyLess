@@ -47,6 +47,9 @@
 //     conversione temporale nell'Eq. 7 del paper originale). Il consumo
 //     energetico va calcolato come Potenza × Tempo di esecuzione = Joule,
 //     quindi idlePowerW * execTimeSec — applicato in energyJoules().
+//     [SUPERATO il 20/11, punto 22] Dopo il ricevimento del 18/11 l'idle non
+//     entra più nella funzione obiettivo (resta in idleEnergyJoules() per i
+//     conti a posteriori).
 //     [NUOVO dal pull del 16/10] Fix di Cecilia alla query Prometheus per
 //     le metriche medie del cloud (internal/metrics/retriever.go,
 //     cloudRegionAverageByFunctionQuery/cloudRegionColdStartProbabilityQuery):
@@ -90,7 +93,8 @@
 //     dati di input sono già disponibili e, se incontra un task ancora in
 //     attesa di dati prodotti altrove, risponde subito ignorandolo
 //     temporaneamente; il nodo sorgente prosegue con le altre fasi del
-//     workflow. Implementato in computeDecisionFromPlacement(): toExecute
+//     workflow. Implementato in computeDecisionFromPlacement(), dal 21/11
+//     computeDecisionsFromPlacement() (punto 24): toExecute
 //     è costruito iterando sull'intero placement cachato (filtrato per
 //     chosenRemote), non più solo su p.ReadyToExecute.
 //  12. [BUG RISOLTO 17/10, confrontando il codice
@@ -120,6 +124,8 @@
 //     deadline, poteva comunque sforare la deadline complessiva della
 //     richiesta nel suo insieme, perché buildPlan non teneva conto del
 //     tempo già "impegnato" dai task precedenti nella stessa catena.
+//     [21/11, punto 24] elapsedChain è sostituito dall'inizio stimato di
+//     ciascun task (startAt), che vale anche per i rami paralleli.
 //     Corretto in buildPlan(): un accumulatore elapsedChain somma il
 //     completionTime (Eq. 2-4) di ogni task via via posizionato nella
 //     catena corrente; il task successivo riceve come budget
@@ -148,7 +154,8 @@
 //     di chiavi di configurazione NUOVE, promosse in
 //     internal/config/keys.go (WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_
 //     NODE/CLOUD_TO_DATA_STORE_TRANSFER/STORAGE_COST, vedi commento sopra
-//     dataStoreTransferCostPerByte/dataStoreStorageCostPerByte), default
+//     dataStoreTransferCostPerByte/dataStoreStorageCostPerByte, sostituite il
+//     20/11 da linkTransferCostPerByte, punto 23), default
 //     0.0 — nessun cambio di comportamento finché non vengono impostate
 //     esplicitamente.
 //     [RISOLTO nel ricevimento del 22/10, non più un limite aperto] la
@@ -159,6 +166,10 @@
 //     farà riferimento a etcd/al modello di storage centralizzato: non c'è
 //     una selezione di storage separati da modellare, quindi non serve una
 //     CO2Intensity distinta per lo storage.
+//     [SUPERATO il 20/11, punto 23] Nel branch dopo il merge i dati non
+//     passano più per un data store: banda, energia e costo dei dati sono
+//     calcolati sui trasferimenti diretti tra nodi; il costo di storage
+//     (CS^f) non c'è più.
 //  15. [NUOVO 30/10, deciso nel ricevimento del 22/10] Vincolo di soglia
 //     minima di accuratezza sulla selezione delle varianti. L'accuratezza del
 //     workflow è il prodotto delle accuratezze dei task: per la funzione del
@@ -212,10 +223,9 @@
 //     workflow); uno sforamento dovuto a condizioni cambiate a runtime è
 //     invece realistico: la richiesta si porta a termine ma, se sfora davvero,
 //     conta come NON completata (da misurare negli esperimenti confrontando il
-//     tempo di risposta con MaxRespT). Scelta implementativa: per il task che
-//     non sta nella deadline si prende la coppia più veloce (selectFastest),
-//     per ridurre il ritardo e quindi la probabilità di sforare davvero; il
-//     piano a rischio viene segnalato nel log una volta per richiesta.
+//     tempo di risposta con MaxRespT). Il ripiego sulla coppia più veloce
+//     (selectFastest), scelto qui l'11/11, è stato tolto il 20/11: vedi punto
+//     21.
 //  18. [NUOVO 11/11, suggerimento di Cecilia dell'11/11] Tempi senza
 //     metriche. Il ripiego di 0.01 s (esecuzione e init) è un valore
 //     generico, non adatto quando la funzione dura secondi: un nodo senza
@@ -234,8 +244,9 @@
 //     9 -> termine G della funzione obiettivo). Prima il codice moltiplicava
 //     per ξ_i l'energia totale, idle compresa: con potenze idle molto diverse
 //     tra nodi (es. cloud 300 W, edge 40 W) cambiava il confronto sul termine
-//     CO2. L'energia (energyJoules) resta invariata, idle compreso e scalato
-//     per il tempo (decisione del 22/10).
+//     CO2. L'energia (energyJoules) restava invariata, idle compreso e scalato
+//     per il tempo (decisione del 22/10); dal 20/11 anche l'energia è senza
+//     idle (punto 22).
 //  20. [NUOVO 16/11] Misure del tuning salvate su file (energyless_tuning.go):
 //     scripts/tune-energyless.sh scrive tempi di esecuzione, di init e
 //     probabilità di cold start per funzione e tipo di nodo (edge/cloud) in un
@@ -245,6 +256,95 @@
 //     (che cambia a ogni riavvio). Ordine: metrica live -> tuning da file ->
 //     default (punto 18). Per il cloud il file evita anche la probabilità di
 //     cold start 0 quando mancano le metriche.
+//  21. [DECISO 18/11 con il prof. Russo Russo, applicato 20/11] Task che non
+//     rispetta più la deadline residua: non si riassegna alla coppia più
+//     veloce sperando di recuperare (supera il ripiego selectFastest del
+//     punto 17), si mantiene il piano senza modificarlo. In buildPlan(), se
+//     nessuna coppia rispetta la deadline residua, il task riceve la coppia
+//     che sceglierebbe comunque la funzione obiettivo con gli stessi pesi,
+//     togliendo solo il vincolo di deadline (capacità, banda e soglia di
+//     accuratezza restano vincoli). Il piano a rischio resta segnalato nel log
+//     una volta per richiesta; se la richiesta sfora davvero lo conteranno i
+//     contatori delle funzioni completate entro la deadline.
+//  22. [DECISO 18/11 con il prof. Russo Russo, applicato 20/11] Modello
+//     energetico della funzione obiettivo:
+//     - la potenza idle ε_i NON entra più nell'energia: i nodi restano
+//     accesi a prescindere dalle decisioni di scheduling, quindi l'idle non
+//     cambia la scelta (supera la decisione del 22/10, punto 5). Resta
+//     idleEnergyJoules() solo per calcolare a posteriori il consumo totale
+//     negli esperimenti. Di conseguenza la CO2 (punto 19) si calcola
+//     sull'energia così com'è, senza sottrarre nulla;
+//     - ogni funzione usa 1 core CPU: energia di esecuzione = potenza di un
+//     core × tempo di esecuzione, al posto della scalatura memoria/2048 ×
+//     CPUDemand del modello di Cecilia (internal/emissions). La chiave
+//     consumption.processing.power è la potenza del NODO ("processing power
+//     consumed by nodes", internal/regions/types.go), quindi la potenza di
+//     un core è quella diviso il numero di core del nodo: pool.cpus in
+//     locale (node.LocalResources.TotalCPUs()), TotalCPU dell'heartbeat per i
+//     vicini, cloud.cores del file della policy per il cloud (default 1).
+//  23. [DECISO 18/11 con il prof. Russo Russo, applicato 20/11] Trasferimento
+//     dati nodo a nodo. Nel main di Serverledge (commit fc93e84 di Matteo
+//     Pallagrosi) i dati non passano più per etcd: viaggiano nel corpo delle
+//     richieste HTTP di offloading (WorkflowInvocationResumeRequest.Data) e
+//     tornano nella risposta (ResumeData.OutputData). Il nodo remoto riceve
+//     sempre CanDoOffloading=false e, appena incontra un task fuori dal suo
+//     ToExecute o la fine del workflow, restituisce dati e risultato
+//     all'ORIGINE: i trasferimenti sono diretti ma con topologia a stella
+//     centrata sull'origine. Quindi, per un task posto sul nodo X il cui input
+//     si trova sul nodo Y (dove è stato eseguito il predecessore, o l'origine
+//     per il primo task):
+//     - X == Y: tempo, energia e costo di trasferimento nulli (decisione del
+//     18/11: task consecutivi sullo stesso nodo non costano nulla);
+//     - X != Y: tratta Y -> origine (se Y non è l'origine) più tratta
+//     origine -> X (se X non è l'origine);
+//     - l'ultimo task funzione del workflow, se è su X != origine, paga anche
+//     il ritorno del risultato X -> origine.
+//     Per ogni tratta: tempo = byte / banda, con le stesse bande della
+//     RemoteOffloadingPolicy del main (edge_to_edge_bandwidth tra nodi edge,
+//     node2datastore.bandwidth tra un nodo edge e il cloud); energia = byte ×
+//     energia di trasmissione del mittente + byte × energia di ricezione del
+//     destinatario, ciascuna con la CO2Intensity del proprio nodo; costo =
+//     byte × costo di trasferimento per byte (cloud2datastore.transfer.cost se
+//     la tratta tocca il cloud, node2datastore.transfer.cost tra nodi edge).
+//     Byte: dimensione media dell'output del predecessore (AvgOutputSize),
+//     ParamsSize della richiesta per il primo task. Il costo di storage
+//     (CS^f) è tolto: non c'è più un data store (e Cecilia il 17/11 aveva già
+//     indicato di ometterlo). Corretta anche l'unità dell'energia di rete del
+//     cloud: il file delle regioni ha lo stesso valore di consumption.energy.tx
+//     dei nodi (nJ/byte), che node.Resources divide per 1e9, mentre prima per
+//     il cloud veniva usato senza dividere.
+//  24. [21/11] Fork-join (ParallelTask del main, lavoro di Matteo Pallagrosi).
+//     Prima buildPlan() seguiva solo GetNext() dei task unari e si fermava al
+//     ParallelTask: i rami e tutto ciò che segue il join restavano fuori dal
+//     piano (eseguiti in locale). Ora:
+//     - la visita segue anche GetBranches() dei FanOutTask, in ordine
+//     topologico: un task (in particolare il join) si pianifica quando sono
+//     stati pianificati tutti i suoi predecessori;
+//     - tempi: l'inizio stimato di un task è il massimo tra le fine stimate
+//     dei predecessori, il budget di deadline è la deadline residua meno
+//     quell'inizio, la durata stimata del workflow è il percorso più lungo
+//     (sostituisce l'accumulatore lineare elapsedChain del punto 13, che
+//     su una catena dà lo stesso risultato);
+//     - dati: un join riceve un input per ramo; zero trasferimenti se tutti i
+//     rami stanno sullo stesso nodo del join, altrimenti ogni output remoto
+//     torna all'origine e da lì va al nodo del join (il motore restituisce
+//     il controllo all'origine finché il join non è eseguibile). I task
+//     strutturali (Pass, ParallelTask) non entrano mai nel piano remoto e
+//     girano sull'origine, quindi i dati ci passano (viaOrigin);
+//     - decisioni: Evaluate() restituisce una decisione per ogni nodo remoto
+//     con task pronti (Invoke del main le accetta tutte ed esegue in locale
+//     i task pronti non offloadati), al posto di un solo nodo per round con
+//     "il locale vince" di ILP/HEFTless, che serializzava i rami.
+//     Doppio conteggio (corretto il 21/11): un trasferimento che serve a più
+//     task (l'output del Fork inviato a un nodo che esegue due rami, o
+//     l'output di un task remoto restituito all'origine e usato da più
+//     successori) avviene una volta sola, quindi energia, CO2 e costo della
+//     tratta si contano una volta (mappa shipped in buildPlan); il tempo
+//     invece resta per ogni task, perché ciascuno aspetta l'arrivo dei dati.
+//     Limiti noti: due rami sullo stesso nodo sono stimati come se non si
+//     contendessero le risorse (tabella delle prenotazioni, punto 7 della
+//     lista del 18/11); un ChoiceTask dentro un ramo ferma la visita, quindi
+//     il join e i task successivi restano fuori dal piano (punto 5).
 package workflow
 
 import (
@@ -334,8 +434,8 @@ type EnergyLessPolicy struct {
 	defaultMinAccuracy float64 // soglia usata se la richiesta non ha MinAccuracy
 	nodeTransferCost   float64 // costo/byte verso il data store, nodo locale/edge
 	cloudTransferCost  float64 // idem, cloud
-	nodeStorageCost    float64
-	cloudStorageCost   float64
+	nodeStorageCost    float64 // [20/11, punto 23] letto ma non più usato: niente costo di storage
+	cloudStorageCost   float64 // idem
 
 	// Tempi di ripiego senza metriche Prometheus (punto 18): da
 	// default.exec.time / default.init.time nel file YAML della policy,
@@ -346,6 +446,10 @@ type EnergyLessPolicy struct {
 	// Misure del tuning lette da file (punto 20): usate quando manca la
 	// metrica live, prima dei default.
 	tuning energyLessTuning
+
+	// Core di un nodo cloud (punto 22): da cloud.cores nel file della policy,
+	// altrimenti defaultCloudCores.
+	cloudCores float64
 
 	// cloudCO2Mu/lastKnownCloudCO2/hasLastKnownCloudCO2: fallback per la
 	// query live della CO2Intensity del cloud (vedi gatherCandidates()).
@@ -375,6 +479,7 @@ func (policy *EnergyLessPolicy) Init() {
 	policy.defaultExecTime = params.defaultExecTime
 	policy.defaultInitTime = params.defaultInitTime
 	policy.tuning = params.tuning
+	policy.cloudCores = params.cloudCores
 	policy.nodeTransferCost = params.nodeTransferCost
 	policy.cloudTransferCost = params.cloudTransferCost
 	policy.nodeStorageCost = params.nodeStorageCost
@@ -425,8 +530,9 @@ type elCandidate struct {
 	availMemMB       float64 // non usato per il candidato CLOUD, vedi estimateOnCandidate
 	availCPU         float64 // idem — per CLOUD si assume capacità infinita (deciso 02/10)
 	co2Intensity     float64 // gCO2eq/kWh — ξ_i nel paper
-	procPowerW       float64 // W — τ_i nel paper (potenza sotto carico, esecuzione)
-	idlePowerW       float64 // W — ε_i nel paper (potenza a riposo, nodo attivo ma senza task in esecuzione). [RIVISTO 17/10] Reintegrata in energyJoules() — la decisione 02/10 di ignorarla è stata superata, vedi punto 5 in testa al file. [CONFERMATO 22/10] Forma scalata per execTimeSec (Potenza×Tempo=Joule), vedi energyJoules()
+	procPowerW       float64 // W — τ_i nel paper: potenza sotto carico dell'intero nodo (consumption.processing.power)
+	cores            float64 // numero di core del nodo, per la potenza di un core (punto 22); <= 0 = sconosciuto
+	idlePowerW       float64 // W — ε_i nel paper (potenza a riposo). [20/11, punto 22] Non entra più nella funzione obiettivo: resta per il consumo totale a posteriori (idleEnergyJoules)
 	txEnergyJPerByte float64 // J/byte — energia NIC in trasmissione
 	rxEnergyJPerByte float64 // J/byte — energia NIC in ricezione
 }
@@ -438,12 +544,17 @@ type elEstimate struct {
 	candidate      elCandidate
 	functionName   string        // nome della funzione o VARIANTE effettivamente valutata (punto 1)
 	completionTime time.Duration // TT^f, Eq. 2-4
-	energyJoules   float64       // E^f, Eq. 7 (include ε_i idle dal 17/10, vedi energyJoules())
+	energyJoules   float64       // E^f, Eq. 7: esecuzione (1 core) + dati, senza ε_i idle dal 20/11 (punto 22)
 	carbonGrams    float64       // CO^f, Eq. 10 (senza ε_i idle dal 15/11, punto 19; termine storage ξ_j: approssimato con ξ_i, confermato corretto 22/10 — vedi estimateOnCandidate)
 	cost           float64       // Z^f = CC^f + CT^f + CS^f, Eq. 13+14+15
 	accuracy       float64       // ∈[0,1], [NUOVO 30/10] accuratezza della funzione/variante scelta rispetto a quella richiesta dal task: 1.0 per la funzione del task, Function.Utility per una variante sostituta (vedi selectBest)
 	objective      float64       // somma pesata normalizzata, Eq. 22
 }
+
+// defaultCloudCores è il numero di core di un nodo cloud quando il file della
+// policy non specifica cloud.cores (punto 22): 1 significa "potenza del nodo
+// intera per funzione", la stima più prudente.
+const defaultCloudCores = 1.0
 
 // defaultMinAccuracy è la soglia minima di accuratezza del workflow usata
 // quando la richiesta non ne specifica una (RequestQoS.MinAccuracy <= 0).
@@ -500,11 +611,13 @@ func (policy *EnergyLessPolicy) minAccuracyThreshold(r *Request) float64 {
 	return t
 }
 
-// Prende in input la richiesta attuale (Request) e lo stato di avanzamento (Progress) e
-// restituisce una decisione (OffloadingDecision) e un eventuale errore (error).
-func (policy *EnergyLessPolicy) evaluateSingle(r *Request, p *Progress) (OffloadingDecision, error) {
+// evaluate prende la richiesta attuale (Request) e lo stato di avanzamento
+// (Progress) e restituisce le decisioni di offloading del round (una per nodo
+// remoto con task pronti, punto 24) e un eventuale errore.
+func (policy *EnergyLessPolicy) evaluate(r *Request, p *Progress) ([]OffloadingDecision, error) {
+	noOffload := []OffloadingDecision{{Offload: false}}
 	if p == nil || !r.CanDoOffloading || len(p.ReadyToExecute) == 0 {
-		return OffloadingDecision{Offload: false}, nil
+		return noOffload, nil
 	}
 
 	// Piano in cache (punto 6): se esiste già un placement valido per questa
@@ -513,7 +626,7 @@ func (policy *EnergyLessPolicy) evaluateSingle(r *Request, p *Progress) (Offload
 	if !ok {
 		candidates := policy.gatherCandidates()
 		if len(candidates) == 0 {
-			return OffloadingDecision{Offload: false}, nil
+			return noOffload, nil
 		}
 
 		residualDeadline := math.Inf(1)
@@ -521,8 +634,9 @@ func (policy *EnergyLessPolicy) evaluateSingle(r *Request, p *Progress) (Offload
 			residualDeadline = r.QoS.MaxRespT - time.Since(r.Arrival).Seconds()
 		}
 
-		// Calcola il placement per TUTTA la catena di task non ancora
-		// eseguiti, una sola volta, e lo cachea.
+		// Calcola il placement per TUTTI i task non ancora eseguiti
+		// raggiungibili (catene e rami di fork-join, punto 24), una sola
+		// volta, e lo cachea.
 		placement = policy.buildPlan(r, p, candidates, residualDeadline)
 		policy.cacheSolution(r.Id, placement)
 	}
@@ -535,18 +649,16 @@ func (policy *EnergyLessPolicy) evaluateSingle(r *Request, p *Progress) (Offload
 		r.Variants = variantChoices(r.W, placement)
 	}
 
-	return policy.computeDecisionFromPlacement(p, placement, r.Variants), nil
+	return policy.computeDecisionsFromPlacement(p, placement, r.Variants), nil
 }
 
 // Evaluate implementa l'interfaccia OffloadingPolicy introdotta con fork-join:
 // Invoke accetta più decisioni (una per destinazione remota) ed esegue in locale
 // tutti i task pronti non inclusi in una decisione di offload.
+// runningTasks non serve: il motore offloada solo i task ancora in
+// ReadyToExecute, quindi quelli già in esecuzione non vengono ripresi.
 func (policy *EnergyLessPolicy) Evaluate(r *Request, p *Progress, runningTasks map[TaskId]bool) ([]OffloadingDecision, error) {
-	d, err := policy.evaluateSingle(r, p)
-	if err != nil {
-		return nil, err
-	}
-	return []OffloadingDecision{d}, nil
+	return policy.evaluate(r, p)
 }
 
 // variantChoices ricava dal piano le sostituzioni "task -> variante": un task
@@ -576,150 +688,226 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 	placement := make(map[TaskId]*elEstimate)
 
 	// Ranking dei task pronti (righe 6-12, Alg. 1): r_f = tempo medio
-	// stimato sulle istanze candidate. NOTA: TODO non propaga ancora il rank dei
-	// predecessori (riga 11) — con la topologia attuale (catene lineari o
-	// Choice, niente FanOut) ReadyToExecute contiene quasi sempre un solo
-	// task per round, quindi l'ordine tra più task pronti conta poco; da
-	// rivedere quando FanOut sarà disponibile.
-	queue := policy.rankReadyTasks(r, p, candidates)
+	// stimato sulle istanze candidate. Dà l'ordine con cui si visitano i
+	// task pronti nello stesso istante (per esempio i rami di un fork).
+	// NOTA: non propaga ancora il rank dei predecessori (riga 11).
+	ready := policy.rankReadyTasks(r, p, candidates)
 
-	// elapsedChain accumula il completionTime (Eq. 2-4) dei task già
-	// posizionati in QUESTA chiamata di buildPlan, camminando la catena.
-	// Serve a calcolare, per il prossimo task, la deadline RESIDUA corretta
-	// ("residualDeadline - elapsedChain") invece di passare sempre la
-	// stessa residualDeadline calcolata una sola volta in Evaluate() —
-	// bug del 17/10 (punto 13 in testa al file):
-	// senza questo accumulo un task a metà catena viene valutato come se
-	// fosse l'unico rimasto, e un piano con più task singolarmente entro
-	// deadline può comunque sforare la deadline complessiva della
-	// richiesta.
-	elapsedChain := 0.0
+	// [NUOVO 21/11, punto 24] Visita in ordine topologico del grafo da
+	// pianificare: si seguono GetNext() dei task unari e GetBranches() dei
+	// FanOutTask (ParallelTask); ci si ferma davanti a un ConditionalTask
+	// (ChoiceTask: il ramo dipende da dati a runtime) e alla fine del
+	// workflow. Un task entra nella visita solo quando sono stati visitati
+	// tutti i suoi predecessori raggiungibili, così il join di un fork viene
+	// pianificato dopo l'ultimo dei suoi rami. pending[t] conta i predecessori
+	// di t ancora da visitare.
+	pending := make(map[TaskId]int)
+	reached := make(map[TaskId]bool)
+	toVisit := append([]TaskId(nil), ready...)
+	for len(toVisit) > 0 {
+		tid := toVisit[0]
+		toVisit = toVisit[1:]
+		if reached[tid] {
+			continue
+		}
+		reached[tid] = true
+		for _, s := range planSuccessors(r.W.Tasks[tid]) {
+			pending[s]++
+			toVisit = append(toVisit, s)
+		}
+	}
+
+	// startAt: istante di inizio stimato di ogni task, misurato dall'inizio
+	// della pianificazione = massimo tra le fine stimate dei predecessori
+	// (Eq. 4 estesa ai rami paralleli). Sostituisce l'accumulatore lineare
+	// elapsedChain del punto 13: su una catena dà lo stesso risultato, su un
+	// fork i rami partono insieme e il join aspetta il ramo più lento. Il
+	// budget di deadline di un task è residualDeadline - startAt[tid];
+	// makespan è la durata stimata del workflow (percorso più lungo).
+	startAt := make(map[TaskId]float64)
+	makespan := 0.0
 
 	// [NUOVO 30/10, deciso nel ricevimento del 22/10] Soglia minima di
-	// accuratezza e accumulatore di catena, speculari a deadline/elapsedChain:
-	// l'accuratezza complessiva del workflow è il PRODOTTO delle accuratezze
-	// dei task (∈[0,1]), e deve restare >= minAccuracy. accChain è il prodotto
-	// dei task già posizionati in QUESTA chiamata. Poiché la funzione del task
-	// ha sempre accuratezza 1.0 (vedi selectBest), i task rimanenti possono
-	// sempre "restituire" il budget: richiedere accChain * acc(task) >= soglia
-	// a ogni passo basta quindi a garantire che il prodotto finale non scenda
-	// sotto soglia. Limite noto: la scelta resta greedy per task (come l'Alg.
-	// 1), quindi un task iniziale può consumare tutto il budget e costringere
-	// i successivi alla funzione base, senza ottimizzare il budget sull'intera
-	// catena.
+	// accuratezza: l'accuratezza complessiva del workflow è il PRODOTTO delle
+	// accuratezze dei task (∈[0,1]), anche di quelli su rami paralleli, e
+	// deve restare >= minAccuracy. accChain è il prodotto dei task già
+	// posizionati in QUESTA chiamata. Poiché la funzione del task ha sempre
+	// accuratezza 1.0 (vedi selectBest), richiedere accChain * acc(task) >=
+	// soglia a ogni passo basta a garantire il prodotto finale. Limite noto:
+	// la scelta resta greedy per task (come l'Alg. 1), vedi punto 8 della
+	// lista del 18/11 (fattore correttivo).
 	minAccuracy := policy.minAccuracyThreshold(r)
 	accChain := 1.0
 
-	// deadlineAtRisk: il piano prevede già di sforare la deadline (punto 17),
-	// usato solo per loggarlo una volta per piano.
+	// deadlineAtRisk: il piano prevede già di sforare la deadline (punti 17 e
+	// 21), usato solo per loggarlo una volta per piano.
 	deadlineAtRisk := false
 
-	for len(queue) > 0 {
-		tid := queue[0]
-		queue = queue[1:]
-		if _, seen := placement[tid]; seen {
+	// [punto 23, esteso il 21/11 col punto 24] Dove si trovano gli input di
+	// ciascun task e quanto pesano, per stimare i trasferimenti nodo a nodo.
+	// Un join ha un input per ogni ramo. I task pronti all'inizio della
+	// visita hanno l'input sull'origine: lo StartTask con i parametri della
+	// richiesta, un task pronto a metà esecuzione con l'output dei
+	// predecessori, già riportato all'origine.
+	origin := originCandidate(candidates)
+	inputsOf := make(map[TaskId][]elDataSource)
+	for _, tid := range ready {
+		// item univoco per ogni task pronto: il suo input non è condiviso con
+		// altri task di questa visita.
+		item := "input:" + tid
+		if _, isStart := r.W.Tasks[tid].(*StartTask); isStart {
+			inputsOf[tid] = []elDataSource{{loc: origin, bytes: float64(r.ParamsSize), item: item}}
+		} else {
+			inputsOf[tid] = []elDataSource{{loc: origin, bytes: predecessorOutputBytes(r.W, tid), item: item}}
+		}
+	}
+	// Tratte già pagate (energia, CO2, costo) dai task posizionati finora
+	// (correzione del doppio conteggio, 21/11).
+	shipped := make(map[string]bool)
+
+	visited := make(map[TaskId]bool)
+	for len(ready) > 0 {
+		tid := ready[0]
+		ready = ready[1:]
+		if visited[tid] {
 			continue
 		}
+		visited[tid] = true
 
 		task := r.W.Tasks[tid]
+		finish := startAt[tid]
+		// outputs: dove si troverà l'output di questo task, passato ai
+		// successori. Default (task strutturali come Start, Pass,
+		// ParallelTask, ma anche un FunctionTask rimasto fuori dal piano):
+		// girano sull'ORIGINE, perché non entrano mai nel piano di un nodo
+		// remoto (punto 23), quindi i loro dati passano dall'origine
+		// (viaOrigin), anche se provenivano da un nodo remoto.
+		outputs := viaOriginSources(inputsOf[tid])
 
-		// Filtra solo i FunctionTask per il placement — ma NON si ferma
-		// qui per gli altri tipi di task, come faceva prima (bug del
-		// 17/10, verificato sul vero task.go/progress.go):
-		// InitProgress() mette SEMPRE in ReadyToExecute, al round 1, solo
-		// lo StartTask (workflow.Start.Id) — che non è un *FunctionTask.
-		// Il codice precedente faceva "continue" su questo mismatch SENZA
-		// accodare il successore, quindi la coda si vuotava subito, il
-		// placement usciva vuoto, e quell'empty map veniva cachata con TTL
-		// 9999 (quasi permanente) — la policy non offloadava mai più per
-		// l'intera vita della richiesta. StartTask/PassTask/FailureTask
-		// (oltre a FunctionTask) implementano tutti UnaryTask (hanno un
-		// GetNext() deterministico, verificato su start_task.go/
-		// pass_task.go/fail_task.go/function_task.go): per questi si segue
-		// GetNext() senza fare placement (non eseguono codice utente, non
-		// c'è nessuna decisione da prendere). Ci si ferma DAVVERO solo per
-		// un ConditionalTask (ChoiceTask: il prossimo task dipende da dati
-		// a runtime, non calcolabile staticamente qui) o per un task senza
-		// alcun successore (EndTask e simili).
-		//
-		// [NUOVO 11/11, punto 17] Il successore si accoda SEMPRE, prima di
-		// qualunque "continue": prima, per un FunctionTask, l'accodamento era
-		// in fondo al ciclo, quindi un task senza coppia fattibile (o con
-		// funzione non trovata) interrompeva la visita e tutti i task
-		// successivi restavano fuori dal piano (eseguiti in locale per sempre,
-		// piano in cache con TTL 9999).
-		if ut, isUnary := task.(UnaryTask); isUnary {
-			if next := ut.GetNext(); next != "" {
-				queue = append(queue, next)
+		if ft, isFunc := task.(*FunctionTask); isFunc {
+			if est := policy.placeFunctionTask(r, tid, ft, candidates, origin, inputsOf[tid], shipped, residualDeadline, startAt[tid], minAccuracy, accChain, &deadlineAtRisk); est != nil {
+				placement[tid] = est
+				finish += est.completionTime.Seconds()
+				accChain *= est.accuracy
+				outputs = []elDataSource{{loc: est.candidate, bytes: outputBytes(est.functionName, ft.Func), producer: tid}}
+			} else {
+				outputs = []elDataSource{{loc: origin, bytes: outputBytes(ft.Func, ft.Func), viaOrigin: true, producer: tid}}
 			}
 		}
-		ft, isFunc := task.(*FunctionTask)
-		if !isFunc {
-			continue
-		}
-		f, found := function.GetFunction(ft.Func)
-		if !found {
-			log.Printf("EnergyLess: funzione %s del task %s non trovata, task lasciato fuori dal piano", ft.Func, tid)
-			continue
+		if finish > makespan {
+			makespan = finish
 		}
 
-		// Budget residuo per QUESTO task (punto 13 in testa al file): la
-		// deadline complessiva della richiesta meno quanto già "consumato"
-		// dai task precedenti nella stessa catena (elapsedChain) — non più
-		// la residualDeadline originale, invariata per tutta la catena.
-		remainingDeadline := residualDeadline
-		if !math.IsInf(residualDeadline, 1) {
-			remainingDeadline = residualDeadline - elapsedChain
-		}
-
-		// Chiama selectBest() (righe 16-23 dell'Alg. 1, esteso con le
-		// varianti — punto 1) per trovare la coppia migliore per questo
-		// task. Se nessuna è fattibile (capacità o deadline residua, ora
-		// correttamente al netto della catena già percorsa), logga e passa
-		// al prossimo task della coda — non abortisce l'intero piano per un
-		// solo task problematico.
-		//
-		// Accuratezza minima richiesta a QUESTO task: da accChain * acc >=
-		// minAccuracy segue acc >= minAccuracy / accChain. Dato che accChain
-		// resta >= minAccuracy (invariante, vedi sopra) il rapporto è <= 1.
-		minTaskAccuracy := minAccuracy / accChain
-		best, err := policy.selectBest(f, candidates, remainingDeadline, minTaskAccuracy)
-		if err != nil {
-			// [NUOVO 11/11, punto 17 — chiarito con Cecilia l'11/11] Nessuna
-			// coppia rispetta la deadline residua. Con deadline coerenti (un
-			// task non può richiedere più della deadline dell'intero workflow:
-			// input da evitare negli esperimenti) succede solo se le condizioni
-			// cambiano durante l'esecuzione. In quel caso la richiesta
-			// probabilmente non rispetterà i requisiti e, se sfora davvero,
-			// andrà contata tra le NON completate; il processamento però si
-			// porta a termine. Per ridurre al minimo il ritardo (e quindi la
-			// probabilità di sforare davvero) si sceglie la coppia più veloce,
-			// ignorando la deadline e rispettando capacità e accuratezza.
-			best, err = policy.selectFastest(f, candidates, minTaskAccuracy)
-			if err != nil {
-				log.Printf("EnergyLess: nessuna coppia fattibile per %s (task %s), nemmeno ignorando la deadline: %v", ft.Func, tid, err)
-				continue
+		// Propagazione ai successori (topologica): inizio = massimo delle
+		// fine dei predecessori, input = unione degli output dei
+		// predecessori; il successore entra nella visita quando sono stati
+		// visitati tutti i suoi predecessori.
+		for _, s := range planSuccessors(task) {
+			if finish > startAt[s] {
+				startAt[s] = finish
 			}
-			if !deadlineAtRisk {
-				deadlineAtRisk = true
-				log.Printf("EnergyLess: richiesta %s, il piano prevede di sforare la deadline al task %s (budget residuo %.3fs): scelta la coppia più veloce, %s su %s (%.3fs)",
-					r.Id, tid, remainingDeadline, best.functionName, best.candidate.key, best.completionTime.Seconds())
+			for _, out := range outputs {
+				out.item = tid // il motore invia i dati indicizzati per predecessore immediato
+				inputsOf[s] = append(inputsOf[s], out)
+			}
+			pending[s]--
+			if pending[s] == 0 {
+				ready = append(ready, s)
 			}
 		}
-		if best.functionName != f.Name {
-			// Ha vinto una variante: oltre al log, la scelta resta in
-			// placement[tid].functionName e viene resa esecutiva da Evaluate()
-			// (variantChoices) e da FunctionTask.exec(), vedi punto 16.
-			log.Printf("EnergyLess: per il task %s scelta la variante %s al posto di %s (accuratezza task %.3f, di catena %.3f, soglia %.3f)",
-				tid, best.functionName, f.Name, best.accuracy, accChain*best.accuracy, minAccuracy)
-		}
-		placement[tid] = best
-		elapsedChain += best.completionTime.Seconds()
-		accChain *= best.accuracy
 	}
 
-	logPlan(r.Id, placement, elapsedChain, residualDeadline)
+	logPlan(r.Id, placement, makespan, residualDeadline)
 	return placement
+}
+
+// placeFunctionTask sceglie la coppia nodo-funzione/variante per un
+// FunctionTask (righe 16-23 dell'Alg. 1, esteso con varianti, deadline
+// residua, soglia di accuratezza e trasferimenti dati). Ritorna nil se il
+// task resta fuori dal piano (funzione non trovata o nessuna coppia
+// fattibile): in quel caso girerà sull'origine.
+func (policy *EnergyLessPolicy) placeFunctionTask(r *Request, tid TaskId, ft *FunctionTask, candidates []elCandidate, origin elCandidate, inputs []elDataSource, shipped map[string]bool, residualDeadline, start, minAccuracy, accChain float64, deadlineAtRisk *bool) *elEstimate {
+	f, found := function.GetFunction(ft.Func)
+	if !found {
+		log.Printf("EnergyLess: funzione %s del task %s non trovata, task lasciato fuori dal piano", ft.Func, tid)
+		return nil
+	}
+	flow := elDataFlow{
+		origin:         origin,
+		inputs:         inputs,
+		returnToOrigin: isLastFunctionTask(r.W, ft),
+		baseFunc:       f.Name,
+		shipped:        shipped,
+	}
+
+	// Budget residuo per QUESTO task (punto 13, esteso col punto 24): la
+	// deadline della richiesta meno l'istante di inizio stimato del task
+	// (fine del predecessore più lento).
+	remainingDeadline := residualDeadline
+	if !math.IsInf(residualDeadline, 1) {
+		remainingDeadline = residualDeadline - start
+	}
+
+	// Accuratezza minima richiesta a QUESTO task: da accChain * acc >=
+	// minAccuracy segue acc >= minAccuracy / accChain (<= 1 per invariante).
+	minTaskAccuracy := minAccuracy / accChain
+	best, err := policy.selectBest(f, candidates, flow, remainingDeadline, minTaskAccuracy)
+	if err != nil {
+		// [DECISO 18/11 con il prof. Russo Russo, punto 21] Nessuna coppia
+		// rispetta la deadline residua: non si ripiega sulla coppia più
+		// veloce, si toglie solo il vincolo di deadline e si prende la coppia
+		// che la funzione obiettivo sceglierebbe comunque con gli stessi pesi
+		// (capacità, banda e accuratezza restano vincoli).
+		best, err = policy.selectBest(f, candidates, flow, math.Inf(1), minTaskAccuracy)
+		if err != nil {
+			log.Printf("EnergyLess: nessuna coppia fattibile per %s (task %s), nemmeno senza il vincolo di deadline: %v", ft.Func, tid, err)
+			return nil
+		}
+		if !*deadlineAtRisk {
+			*deadlineAtRisk = true
+			log.Printf("EnergyLess: richiesta %s, il piano prevede di sforare la deadline al task %s (budget residuo %.3fs): piano mantenuto, %s su %s (%.3fs)",
+				r.Id, tid, remainingDeadline, best.functionName, best.candidate.key, best.completionTime.Seconds())
+		}
+	}
+	if best.functionName != f.Name {
+		// Ha vinto una variante: la scelta resta in placement[tid].functionName
+		// e viene resa esecutiva da variantChoices e FunctionTask.exec()
+		// (punto 16).
+		log.Printf("EnergyLess: per il task %s scelta la variante %s al posto di %s (accuratezza task %.3f, di catena %.3f, soglia %.3f)",
+			tid, best.functionName, f.Name, best.accuracy, accChain*best.accuracy, minAccuracy)
+	}
+	// Registra le tratte usate dalla coppia scelta: i task posizionati dopo
+	// non ne pagheranno di nuovo energia, CO2 e costo (doppio conteggio).
+	policy.transferEstimate(flow, best.candidate, outputBytes(best.functionName, f.Name), shipped)
+	return best
+}
+
+// planSuccessors sono i task da visitare dopo t nella pianificazione
+// statica (punto 24): il successore di un task unario, i rami di un
+// FanOutTask; nessuno per un ConditionalTask (il ramo si conosce solo a
+// runtime, punto 5 della lista del 18/11) e per la fine del workflow.
+func planSuccessors(t Task) []TaskId {
+	switch tt := t.(type) {
+	case UnaryTask:
+		if next := tt.GetNext(); next != "" {
+			return []TaskId{next}
+		}
+	case FanOutTask:
+		return tt.GetBranches()
+	}
+	return nil
+}
+
+// viaOriginSources marca gli input di un task che gira sull'origine come
+// "passati dall'origine": il successore dovrà riceverli dall'origine anche
+// se erano stati prodotti sul suo stesso nodo (punto 23).
+func viaOriginSources(in []elDataSource) []elDataSource {
+	out := make([]elDataSource, len(in))
+	for i, s := range in {
+		s.viaOrigin = true
+		out[i] = s
+	}
+	return out
 }
 
 // logPlan scrive il piano calcolato in una riga di log (una volta per piano):
@@ -736,7 +924,7 @@ func logPlan(reqId string, placement map[TaskId]*elEstimate, chainSec float64, r
 	parts := make([]string, 0, len(ids))
 	for _, tid := range ids {
 		est := placement[tid]
-		parts = append(parts, fmt.Sprintf("%s->%s/%s %.3fs", tid, est.candidate.key, est.functionName, est.completionTime.Seconds()))
+		parts = append(parts, fmt.Sprintf("%s->%s/%s %.3fs %.1fJ", tid, est.candidate.key, est.functionName, est.completionTime.Seconds(), est.energyJoules))
 	}
 	deadline := "nessuna"
 	if !math.IsInf(residualDeadline, 1) {
@@ -746,98 +934,74 @@ func logPlan(reqId string, placement map[TaskId]*elEstimate, chainSec float64, r
 		reqId, len(ids), chainSec, deadline, strings.Join(parts, ", "))
 }
 
-// computeDecisionFromPlacement traduce il placement già calcolato (in
-// cache) in una OffloadingDecision per il round corrente — stesso ruolo di
-// computeDecisionFromPlacement in ILP/HEFTless, ma qui senza richiamare
+// computeDecisionsFromPlacement traduce il placement già calcolato (in
+// cache) nelle OffloadingDecision del round corrente, senza richiamare
 // selectBest(): legge solo quanto già deciso in buildPlan().
-func (policy *EnergyLessPolicy) computeDecisionFromPlacement(p *Progress, placement map[TaskId]*elEstimate, variants map[TaskId]string) OffloadingDecision {
-	// Fase 1 — SOLO per decidere SE offloadare questo round e VERSO QUALE
-	// nodo: si guardano ancora i task pronti ora (p.ReadyToExecute), stessa
-	// logica greedy di prima (locale vince subito; altrimenti il primo task
-	// pronto remoto fissa chosenRemote). Questa parte NON decide più il
-	// contenuto del piano da inviare — solo il nodo di destinazione.
-	localWins := false
-	var chosenRemote *elCandidate
-
+func (policy *EnergyLessPolicy) computeDecisionsFromPlacement(p *Progress, placement map[TaskId]*elEstimate, variants map[TaskId]string) []OffloadingDecision {
+	// [NUOVO 21/11, punto 24] Una decisione per ogni nodo remoto che ha
+	// almeno un task PRONTO nel piano. Con il fork-join più task possono
+	// essere pronti nello stesso round (i rami di un ParallelTask): il motore
+	// del main (Invoke) accetta più decisioni e, nello stesso round, esegue in
+	// locale i task pronti non offloadati. Sostituisce la logica di
+	// ILP/HEFTless (un solo nodo remoto per round, e nessun offloading se un
+	// task pronto è assegnato al nodo locale), che con task paralleli
+	// serializzava i rami. Sulle catene (un task pronto per round) il
+	// comportamento non cambia. I task pronti fuori dal piano (es. dopo un
+	// ChoiceTask) restano in locale.
+	remotes := make(map[string]elCandidate)
 	for _, tid := range p.ReadyToExecute {
-		est, ok := placement[tid]
-		if !ok {
-			// Task non coperto dal piano cachato (es. nuovo ramo dopo un
-			// ChoiceTask non previsto in buildPlan): lasciato in locale per
-			// questo round, non forza un ricalcolo del piano intero.
-			continue
-		}
-
-		// Se il candidato migliore per il task corrente è il nodo locale, si ferma tutto il ciclo (break).
-		if est.candidate.isLocal {
-			localWins = true
-			break // stesso comportamento di computeDecisionFromPlacement in ILP/HEFTless: locale vince subito
-		}
-
-		// Se invece il candidato migliore è remoto: chosenRemote viene aggiornato a OGNI task
-		// pronto remoto incontrato (non solo al primo). Verificato sul codice reale di
-		// computeDecisionFromPlacement in remote_offloading_policy.go (ILP/HEFTless):
-		//   for _, t := range p.ReadyToExecute {
-		//       assignedNode := placement[t]
-		//       if assignedNode == registration.SelfRegistration.Key { localExecution = true; break }
-		//       else { remoteNode = assignedNode }
-		//   }
-		// cioè se p.ReadyToExecute contiene più task pronti assegnati a nodi remoti diversi, vince
-		// l'ULTIMO incontrato nell'ordine dello slice, non il primo — replicato qui identicamente
-		// per restare fedeli al comportamento originale (anche se non è l'unica scelta sensata).
-		c := est.candidate
-		chosenRemote = &c
-	}
-
-	// Se localWins è vero (un task ha "vinto" localmente) oppure non è mai stato trovato nessun
-	// candidato remoto valido
-	if localWins || chosenRemote == nil {
-		return OffloadingDecision{Offload: false}
-	}
-
-	// Fase 2 — chiarito nel ricevimento del 02/10 (punto 11 nell'header):
-	// l'offloading plan NON si limita ai task pronti ora o consecutivi —
-	// include TUTTI i task del piano cachato assegnati a chosenRemote per
-	// l'intera richiesta (visione totale). Il nodo remoto, ricevuto il
-	// piano, esegue i task i cui dati di input sono già disponibili e, se
-	// incontra un task ancora in attesa di dati prodotti altrove, risponde
-	// subito ignorandolo temporaneamente; il nodo sorgente prosegue con le
-	// altre fasi del workflow. Per questo si itera su TUTTO placement, non
-	// solo su p.ReadyToExecute. L'ordine è reso deterministico (utile per
-	// log/debug ed esperimenti riproducibili) ordinando le chiavi come
-	// stringa, dato che TaskId non è garantito avere un ordine naturale.
-	toExecute := make([]TaskId, 0, len(placement))
-	for tid, est := range placement {
-		if est.candidate.key == chosenRemote.key {
-			toExecute = append(toExecute, tid)
+		if est, ok := placement[tid]; ok && !est.candidate.isLocal {
+			remotes[est.candidate.key] = est.candidate
 		}
 	}
-	sort.Slice(toExecute, func(i, j int) bool {
-		return fmt.Sprintf("%v", toExecute[i]) < fmt.Sprintf("%v", toExecute[j])
-	})
+	if len(remotes) == 0 {
+		return []OffloadingDecision{{Offload: false}}
+	}
+	keys := make([]string, 0, len(remotes))
+	for k := range remotes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // ordine deterministico, utile per log ed esperimenti riproducibili
 
-	// Le varianti scelte per i task offloadati viaggiano nel piano (punto 16):
-	// il nodo remoto non ripianifica, esegue ciò che l'origine ha deciso.
-	var planVariants map[TaskId]string
-	for _, tid := range toExecute {
-		if v, chosen := variants[tid]; chosen {
-			if planVariants == nil {
-				planVariants = make(map[TaskId]string)
+	decisions := make([]OffloadingDecision, 0, len(keys))
+	for _, key := range keys {
+		// Visione totale (punto 11, ricevimento del 02/10): il piano inviato a
+		// un nodo contiene TUTTI i task del placement assegnati a quel nodo,
+		// non solo quelli pronti ora. Il nodo remoto esegue quelli con i dati
+		// disponibili e restituisce il controllo all'origine davanti a un task
+		// non suo o non ancora eseguibile (per esempio un join con un ramo su
+		// un altro nodo). Il motore invia comunque solo i task pronti
+		// (dispatchReadyTasks filtra ToExecute su ReadyToExecute).
+		toExecute := make([]TaskId, 0, len(placement))
+		for tid, est := range placement {
+			if est.candidate.key == key {
+				toExecute = append(toExecute, tid)
 			}
-			planVariants[tid] = v
 		}
-	}
+		sort.Slice(toExecute, func(i, j int) bool { return toExecute[i] < toExecute[j] })
 
-	// Si ritorna una decisione di offload positiva: RemoteHost è l'URL del nodo scelto,
-	// e OffloadingPlan.ToExecute è la lista COMPLETA dei task di competenza di quel nodo.
-	return OffloadingDecision{
-		Offload:    true,
-		RemoteHost: chosenRemote.apiURL,
-		OffloadingPlan: OffloadingPlan{
-			ToExecute: toExecute,
-			Variants:  planVariants,
-		},
+		// Le varianti scelte per i task offloadati viaggiano nel piano
+		// (punto 16): il nodo remoto non ripianifica.
+		var planVariants map[TaskId]string
+		for _, tid := range toExecute {
+			if v, chosen := variants[tid]; chosen {
+				if planVariants == nil {
+					planVariants = make(map[TaskId]string)
+				}
+				planVariants[tid] = v
+			}
+		}
+
+		decisions = append(decisions, OffloadingDecision{
+			Offload:    true,
+			RemoteHost: remotes[key].apiURL,
+			OffloadingPlan: OffloadingPlan{
+				ToExecute: toExecute,
+				Variants:  planVariants,
+			},
+		})
 	}
+	return decisions
 }
 
 // cacheSolution e getCachedPlan implementano la cache del piano per
@@ -946,6 +1110,7 @@ func (policy *EnergyLessPolicy) gatherCandidates() []elCandidate {
 			availCPU:         node.LocalResources.AvailableCPUs(),
 			co2Intensity:     node.LocalResources.CO2Intensity(),
 			procPowerW:       node.LocalResources.ProcessingPower(),
+			cores:            node.LocalResources.TotalCPUs(),
 			idlePowerW:       node.LocalResources.IdlePower(),
 			txEnergyJPerByte: node.LocalResources.TxEnergyPerByte(),
 			rxEnergyJPerByte: node.LocalResources.RxEnergyPerByte(),
@@ -972,6 +1137,7 @@ func (policy *EnergyLessPolicy) gatherCandidates() []elCandidate {
 			availCPU:         status.TotalCPU - status.UsedCPU,
 			co2Intensity:     status.CO2Intensity,
 			procPowerW:       status.ProcessingPowerConsumption,
+			cores:            status.TotalCPU,
 			idlePowerW:       status.IdlePowerConsumption,
 			txEnergyJPerByte: status.TxEnergyConsumption,
 			rxEnergyJPerByte: status.RxEnergyConsumption,
@@ -1030,13 +1196,17 @@ func (policy *EnergyLessPolicy) gatherCandidates() []elCandidate {
 			apiURL:       cloud.APIUrl(),
 			area:         cloud.Area,
 			co2Intensity: cloudCO2,
+			cores:        policy.cloudCores, // il cloud non manda TotalCPU: cloud.cores del file della policy (punto 22)
 		}
 		if policy.regionsCfg != nil {
 			if info, ok := policy.regionsCfg.Area(cloud.Area); ok {
 				c.procPowerW = info.ProcessingPowerConsumption
 				c.idlePowerW = info.IdlePowerConsumption
-				c.txEnergyJPerByte = info.TxEnergyConsumption
-				c.rxEnergyJPerByte = info.RxEnergyConsumption
+				// Stessa unità di consumption.energy.tx/rx dei nodi (nJ/byte):
+				// node.Resources la divide per 1e9, qui va fatto lo stesso
+				// (punto 23).
+				c.txEnergyJPerByte = info.TxEnergyConsumption / 1e9
+				c.rxEnergyJPerByte = info.RxEnergyConsumption / 1e9
 			}
 		}
 		candidates = append(candidates, c)
@@ -1128,22 +1298,13 @@ func validVariants(f *function.Function) []*function.Function {
 // scartata PRIMA della stima se sta sotto minTaskAccuracy — così non entra
 // nemmeno nella normalizzazione dell'Eq. 22, esattamente come una coppia
 // infattibile per deadline o capacità.
-func (policy *EnergyLessPolicy) selectBest(f *function.Function, candidates []elCandidate, residualDeadline float64, minTaskAccuracy float64) (*elEstimate, error) {
-	return policy.selectWithWeights(policy.weights, f, candidates, residualDeadline, minTaskAccuracy)
-}
-
-// selectFastest è il ripiego di buildPlan quando nessuna coppia rispetta la
-// deadline residua (punto 17): stessa enumerazione di selectBest (capacità,
-// banda e soglia di accuratezza restano vincoli), ma senza deadline e con
-// tutto il peso sul tempo, quindi sceglie la coppia con il completionTime
-// minimo.
-func (policy *EnergyLessPolicy) selectFastest(f *function.Function, candidates []elCandidate, minTaskAccuracy float64) (*elEstimate, error) {
-	return policy.selectWithWeights(energyLessWeights{time: 1.0}, f, candidates, math.Inf(1), minTaskAccuracy)
+func (policy *EnergyLessPolicy) selectBest(f *function.Function, candidates []elCandidate, flow elDataFlow, residualDeadline float64, minTaskAccuracy float64) (*elEstimate, error) {
+	return policy.selectWithWeights(policy.weights, f, candidates, flow, residualDeadline, minTaskAccuracy)
 }
 
 // selectWithWeights contiene la logica di selectBest con i pesi dell'Eq. 22
 // passati come parametro (usati solo per l'obiettivo, non per i vincoli).
-func (policy *EnergyLessPolicy) selectWithWeights(weights energyLessWeights, f *function.Function, candidates []elCandidate, residualDeadline float64, minTaskAccuracy float64) (*elEstimate, error) {
+func (policy *EnergyLessPolicy) selectWithWeights(weights energyLessWeights, f *function.Function, candidates []elCandidate, flow elDataFlow, residualDeadline float64, minTaskAccuracy float64) (*elEstimate, error) {
 	rm := metrics.GetMetrics()
 	var variants []*function.Function
 	for _, v := range validVariants(f) {
@@ -1164,7 +1325,7 @@ func (policy *EnergyLessPolicy) selectWithWeights(weights energyLessWeights, f *
 
 	// iterazione su istanza i (= candidato)
 	for _, c := range candidates {
-		baseExecTime, baseEst, ok := policy.estimateOnCandidate(rm, c, f, f.Name, residualDeadline, policy.fallbackExecTime())
+		baseExecTime, baseEst, ok := policy.estimateOnCandidate(rm, c, f, f.Name, flow, residualDeadline, policy.fallbackExecTime())
 		if ok {
 			baseEst.accuracy = 1.0 // la funzione del task non è degradata
 			accumulate(baseEst)
@@ -1188,7 +1349,7 @@ func (policy *EnergyLessPolicy) selectWithWeights(weights energyLessWeights, f *
 				// (populateOptimizerVariant) per lo stesso problema.
 				fallback = baseExecTime / v.SpeedUp
 			}
-			_, vEst, vOk := policy.estimateOnCandidate(rm, c, v, v.Name, residualDeadline, fallback)
+			_, vEst, vOk := policy.estimateOnCandidate(rm, c, v, v.Name, flow, residualDeadline, fallback)
 			if !vOk {
 				continue
 			}
@@ -1235,7 +1396,7 @@ func (policy *EnergyLessPolicy) selectWithWeights(weights energyLessWeights, f *
 // (Eq. 20) — una banda non configurata per un candidato veniva trattata
 // come "trasferimento istantaneo" invece che come candidato infattibile.
 // Tutti e quattro aggiunti qui.
-func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics, c elCandidate, fn *function.Function, metricName string, residualDeadline float64, fallbackExecTime float64) (execTime float64, est *elEstimate, ok bool) {
+func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics, c elCandidate, fn *function.Function, metricName string, flow elDataFlow, residualDeadline float64, fallbackExecTime float64) (execTime float64, est *elEstimate, ok bool) {
 	// Vincolo di capacità (Eq. 18-19 / ρ_i, Eq. 21 — chiarito 02/10 che ρ_i
 	// corrisponde ad available CPU, già controllato qui): per il candidato
 	// CLOUD il controllo è saltato interamente, perché si assume capacità
@@ -1270,45 +1431,22 @@ func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics,
 	initTime := estimateInitTime(rm, c, metricName, policy.fallbackInitTime(), tv, tuned)
 	completion := time.Duration((execTime + initTime) * float64(time.Second))
 
-	var transferCost, storageCost float64
-	if !c.isLocal {
-		// Vincolo di banda (Eq. 20): se per questo TIPO di candidato
-		// (edge/nodo vs cloud) non è configurata una banda verso il data
-		// store, il candidato non è fattibile — non si tratta più un
-		// collegamento non configurato come "a tempo zero" (comportamento
-		// della precedente transferTime(), che favoriva artificialmente un
-		// candidato remoto mal configurato facendolo apparire più
-		// veloce/economico di uno locale).
-		bandwidthMbps := dataStoreBandwidthMbps(c)
-		if bandwidthMbps <= 0 {
-			return execTime, nil, false
-		}
-		// Stessa proxy approssimata già usata in energyJoules() (nessuna
-		// dimensione di input per-task propagata: si riusa la dimensione
-		// media di OUTPUT della funzione come stand-in sia per il dato da
-		// scaricare — CT^f, δ^f — sia per quello da salvare — CS^f, δe^f).
-		dataBytes := metrics.GetMetrics().AvgOutputSize[fn.Name]
-		bandwidthBytesPerSec := bandwidthMbps * 1_000_000 / 8
-		completion += time.Duration(dataBytes / bandwidthBytesPerSec * float64(time.Second))
-
-		// Costo di trasferimento (CT^f, Eq. 14) e di storage (CS^f, Eq. 15):
-		// entrambi 0 per esecuzione locale (stessa convenzione già in uso
-		// per transferEnergy in energyJoules — nessun movimento di rete né,
-		// per lo storage locale/edge, un costo da modellare: coerente con
-		// l'esclusione "j ∈ S \ SE" di Eq. 15 nel paper, che tiene lo
-		// storage edge fuori dal costo). Chiavi di configurazione NUOVE
-		// (vedi dataStoreTransferCostPerByte/dataStoreStorageCostPerByte),
-		// default 0.0: finché non vengono impostate esplicitamente, nessun
-		// cambio di comportamento per chi già usa questa bozza.
-		transferCost = policy.dataStoreTransferCostPerByte(c) * dataBytes
-		storageCost = policy.dataStoreStorageCostPerByte(c) * dataBytes
+	// [NUOVO 20/11, punto 23] Trasferimenti dati nodo a nodo: tempo (Eq. 3),
+	// energia di rete (parte dati dell'Eq. 7), CO2 dei dati (Eq. 10) e costo
+	// di trasferimento (CT^f, Eq. 14). Zero se l'input è già su questo nodo e
+	// il risultato non deve tornare all'origine. Una tratta senza banda
+	// configurata rende il candidato infattibile (vincolo di banda, Eq. 20).
+	tr, feasible := policy.transferEstimate(flow, c, outputBytes(metricName, flow.baseFunc), nil)
+	if !feasible {
+		return execTime, nil, false
 	}
+	completion += time.Duration(tr.seconds * float64(time.Second))
 
 	if !math.IsInf(residualDeadline, 1) && completion.Seconds() > residualDeadline {
 		return execTime, nil, false // vincolo di deadline, Eq. 5
 	}
 
-	energyJ := energyJoules(c, fn, execTime)
+	energyJ := energyJoules(c, execTime) + tr.energyJ
 	// [RISOLTO nel ricevimento del 22/10] Eq. 10 del paper distingue
 	// l'intensità di carbonio del CANDIDATO (ξ_i, per la componente di
 	// esecuzione) da quella dello STORAGE (ξ_j, per la componente dati).
@@ -1324,11 +1462,15 @@ func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics,
 	//
 	// [DECISO 15/11, punto 19] Come nell'Eq. 10 del paper, la CO2 si calcola
 	// solo dall'energia di ESECUZIONE e dei DATI (CO^f = ξ_i·E_exec + ξ_j·E_data;
-	// anche l'Alg. 2, riga 4, non ha ε_i): l'energia idle ε_i resta nel
-	// termine dell'energia (Eq. 7) ma non entra nelle emissioni.
-	carbonJ := energyJ - idleEnergyJoules(c, execTime)
-	carbonG := (carbonJ / 3.6e6) * c.co2Intensity                    // Eq. 10, stessa conversione J->kWh di emissions.joulesToKWh
-	cost := regionCost(c.area)*execTime + transferCost + storageCost // Eq. 13 (ΔC_i · ψ_i^f) + Eq. 14 + Eq. 15
+	// anche l'Alg. 2, riga 4, non ha ε_i). Dal 20/11 (punto 22) anche
+	// energyJ è senza idle, quindi la CO2 si calcola direttamente su energyJ.
+	//
+	// [20/11, punto 23] L'energia di esecuzione usa la CO2Intensity del
+	// candidato; quella dei dati è già convertita in grammi tratta per tratta
+	// (trasmissione con l'intensità del mittente, ricezione con quella del
+	// destinatario), al posto dell'approssimazione ξ_j ≈ ξ_i.
+	carbonG := (energyJoules(c, execTime)/3.6e6)*c.co2Intensity + tr.carbonG // Eq. 10, J->kWh come emissions.joulesToKWh
+	cost := regionCost(c.area)*execTime + tr.cost                            // Eq. 13 (ΔC_i · ψ_i^f) + Eq. 14; niente CS^f (punto 23)
 
 	return execTime, &elEstimate{
 		candidate:      c,
@@ -1401,91 +1543,274 @@ func estimateInitTime(rm metrics.RetrievedMetrics, c elCandidate, funcName strin
 	return fallbackInit * prob // default.init.time (punto 18)
 }
 
-// Chiavi di configurazione NUOVE per il costo di trasferimento (Eq. 14) e di
-// storage (Eq. 15). [AGGIORNATO 17/10] Promosse a costanti
-// condivise in internal/config/keys.go (WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_
-// NODE/CLOUD_TO_DATA_STORE_TRANSFER/STORAGE_COST, stesso schema
-// "node2datastore"/"cloud2datastore" già usato per la banda) — non più
-// costanti locali non esportate come nella prima versione di questa
-// modifica. Stessi valori stringa, nessun cambio di comportamento. Default
-// 0.0 — finché non vengono impostate esplicitamente in configurazione,
-// costo di trasferimento e di storage restano a zero.
+// ---------------------------------------------------------------------
+// Trasferimento dati nodo a nodo (punto 23).
+// ---------------------------------------------------------------------
 
-// dataStoreBandwidthMbps/dataStoreTransferCostPerByte/dataStoreStorageCostPerByte
-// centralizzano la scelta tra configurazione "verso il cloud" e "verso un
-// nodo edge/locale", usata sia per il vincolo di banda e il tempo di
-// trasferimento sia per i nuovi termini di costo — un solo punto invece di
-// ripetere lo stesso "if c.key == CLOUD" in più punti del file.
-func dataStoreBandwidthMbps(c elCandidate) float64 {
-	if c.key == "CLOUD" {
-		return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_CLOUD_TO_DATA_STORE_BANDWIDTH, 1000)
-	}
-	return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_NODE_TO_DATA_STORE_BANDWIDTH, 40.0)
+// elDataSource dice dove si trova un dato (il nodo candidato che lo ha
+// prodotto, o l'origine) e quanti byte pesa.
+type elDataSource struct {
+	loc   elCandidate
+	bytes float64
+	// viaOrigin: il dato, dopo essere stato prodotto su loc, è passato da un
+	// task che gira sull'origine (Pass, ParallelTask, ...): il successore lo
+	// riceve dall'origine anche se si trova sullo stesso nodo loc (punto 24).
+	viaOrigin bool
+	// [21/11, doppio conteggio] Identità del dato, per contare una sola
+	// volta energia, CO2 e costo di una tratta che serve a più task:
+	// producer è il task che lo ha prodotto su loc (il nodo remoto lo
+	// restituisce all'origine una volta sola); item è il predecessore
+	// immediato del task che lo riceve, cioè la chiave con cui il motore lo
+	// invia (prepareOffloadData lo mette una volta per richiesta, anche se lo
+	// usano più task offloadati insieme).
+	producer TaskId
+	item     TaskId
 }
 
-func (policy *EnergyLessPolicy) dataStoreTransferCostPerByte(c elCandidate) float64 {
-	if c.key == "CLOUD" {
+// elDataFlow descrive i dati che un task deve ricevere e restituire, per
+// stimarne i trasferimenti su ciascun candidato.
+type elDataFlow struct {
+	origin         elCandidate    // nodo da cui parte la richiesta (centro della stella)
+	inputs         []elDataSource // dove si trovano gli input del task (uno per predecessore, più di uno per un join) e quanto pesano
+	returnToOrigin bool           // ultimo task funzione: il risultato torna all'origine
+	baseFunc       string         // funzione del task, per la dimensione dell'output di una variante senza metrica
+	// shipped: tratte già pagate (energia, CO2, costo) da task posizionati
+	// prima nello stesso piano; letta durante la stima, aggiornata da
+	// buildPlan dopo ogni scelta (doppio conteggio, 21/11).
+	shipped map[string]bool
+}
+
+// elTransfer è la stima dei trasferimenti di un task su un candidato.
+type elTransfer struct {
+	seconds float64
+	energyJ float64
+	carbonG float64
+	cost    float64
+}
+
+// transferEstimate somma le tratte necessarie per eseguire il task sul
+// candidato c, con la topologia a stella del branch (punto 23): ogni input va
+// da dove si trova all'origine e dall'origine a c, saltando le tratte nulle;
+// il risultato dell'ultimo task torna all'origine. Ritorna false se una
+// tratta necessaria non ha banda configurata.
+func (policy *EnergyLessPolicy) transferEstimate(flow elDataFlow, c elCandidate, outBytes float64, record map[string]bool) (elTransfer, bool) {
+	var total elTransfer
+	// add somma una tratta. Il TEMPO si conta sempre: un task deve comunque
+	// aspettare che i dati arrivino, anche se viaggiano nella stessa
+	// richiesta di un altro ramo. Energia, CO2 e costo invece si contano
+	// una volta sola per trasferimento fisico (chiave key): se la tratta è
+	// già stata pagata da un task posizionato prima, per questo task valgono
+	// zero (correzione del doppio conteggio, 21/11). Con record != nil la
+	// tratta viene registrata come pagata.
+	add := func(src, dst elCandidate, timeBytes, energyBytes float64, keys []string) bool {
+		t, ok := policy.hop(src, dst, timeBytes)
+		if !ok {
+			return false
+		}
+		total.seconds += t.seconds
+		if energyBytes > 0 {
+			e, _ := policy.hop(src, dst, energyBytes)
+			total.energyJ += e.energyJ
+			total.carbonG += e.carbonG
+			total.cost += e.cost
+		}
+		if record != nil && src.key != dst.key {
+			for _, k := range keys {
+				record[k] = true
+			}
+		}
+		return true
+	}
+	paid := func(key string) bool { return flow.shipped[key] }
+
+	// [21/11, punto 24] Input da più predecessori (join di un fork). Se
+	// tutti gli input sono già su c, prodotti lì senza passare dall'origine,
+	// non c'è nessun trasferimento: i predecessori e il task girano nello
+	// stesso segmento remoto. Altrimenti il nodo remoto non può eseguire il
+	// task (per esempio il join non è eseguibile finché un ramo è altrove),
+	// quindi restituisce i propri output all'origine: ogni input che sta su
+	// un nodo diverso dall'origine fa la tratta verso l'origine, e poi
+	// l'origine invia a c tutti gli input insieme.
+	local := true
+	for _, in := range flow.inputs {
+		if in.loc.key != c.key || in.viaOrigin {
+			local = false
+			break
+		}
+	}
+	if !local {
+		var toC, toCUnpaid float64
+		var sendKeys []string
+		for _, in := range flow.inputs {
+			if in.loc.key != flow.origin.key {
+				// Ritorno all'origine dell'output di in.producer: una sola
+				// volta, qualunque sia il numero di task che lo usano.
+				backKey := "back|" + string(in.producer) + "|" + in.loc.key
+				energyBytes := in.bytes
+				if paid(backKey) {
+					energyBytes = 0
+				}
+				if !add(in.loc, flow.origin, in.bytes, energyBytes, []string{backKey}) {
+					return total, false
+				}
+			}
+			// Invio dall'origine a c dell'output di in.item: una sola volta
+			// per nodo destinatario.
+			sendKey := "send|" + string(in.item) + "|" + c.key
+			toC += in.bytes
+			if !paid(sendKey) {
+				toCUnpaid += in.bytes
+			}
+			sendKeys = append(sendKeys, sendKey)
+		}
+		if c.key != flow.origin.key && !add(flow.origin, c, toC, toCUnpaid, sendKeys) {
+			return total, false
+		}
+	}
+	if flow.returnToOrigin && c.key != flow.origin.key && !add(c, flow.origin, outBytes, outBytes, nil) {
+		return total, false
+	}
+	return total, true
+}
+
+// hop stima una singola tratta src -> dst di bytes byte. Nulla se src e dst
+// sono lo stesso nodo o non ci sono dati da spostare.
+func (policy *EnergyLessPolicy) hop(src, dst elCandidate, bytes float64) (elTransfer, bool) {
+	if src.key == dst.key || bytes <= 0 {
+		return elTransfer{}, true
+	}
+	bandwidthMbps := linkBandwidthMbps(src, dst)
+	if bandwidthMbps <= 0 {
+		return elTransfer{}, false
+	}
+	txJ := bytes * src.txEnergyJPerByte
+	rxJ := bytes * dst.rxEnergyJPerByte
+	return elTransfer{
+		seconds: bytes / (bandwidthMbps * 1_000_000 / 8),
+		energyJ: txJ + rxJ,
+		carbonG: (txJ/3.6e6)*src.co2Intensity + (rxJ/3.6e6)*dst.co2Intensity,
+		cost:    bytes * policy.linkTransferCostPerByte(src, dst),
+	}, true
+}
+
+// linkBandwidthMbps è la banda di una tratta, con le stesse chiavi e gli
+// stessi default della RemoteOffloadingPolicy del main (commit 5107d34):
+// edge_to_edge_bandwidth tra due nodi edge, node2datastore.bandwidth tra un
+// nodo edge e il cloud.
+func linkBandwidthMbps(src, dst elCandidate) float64 {
+	if src.key == "CLOUD" || dst.key == "CLOUD" {
+		return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_NODE_TO_DATA_STORE_BANDWIDTH, 40.0)
+	}
+	return config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_EDGE_TO_EDGE_BANDWIDTH, 100.0)
+}
+
+// linkTransferCostPerByte è il costo per byte di una tratta (CT^f, Eq. 14):
+// cloud2datastore.transfer.cost se la tratta tocca il cloud,
+// node2datastore.transfer.cost tra nodi edge. Default 0.
+func (policy *EnergyLessPolicy) linkTransferCostPerByte(src, dst elCandidate) float64 {
+	if src.key == "CLOUD" || dst.key == "CLOUD" {
 		return policy.cloudTransferCost
 	}
 	return policy.nodeTransferCost
 }
 
-func (policy *EnergyLessPolicy) dataStoreStorageCostPerByte(c elCandidate) float64 {
-	if c.key == "CLOUD" {
-		return policy.cloudStorageCost
+// originCandidate è il candidato locale, cioè il nodo che sta pianificando
+// (la ripianificazione avviene solo sull'origine: i nodi remoti ricevono
+// CanDoOffloading=false).
+func originCandidate(candidates []elCandidate) elCandidate {
+	for _, c := range candidates {
+		if c.isLocal {
+			return c
+		}
 	}
-	return policy.nodeStorageCost
+	return elCandidate{isLocal: true}
 }
 
-// energyJoules è la traduzione diretta dell'Eq. 7 del paper (E^f). Qui si
-// scrive la formula per esteso, invece di richiamare
-// internal/emissions.Compute(), perché quella funzione è pensata per il
-// modello ad "edge aggregato" della policy CO2/QoS (parametri
-// InitialNode/LocalNode/AggrInitialNodeMemory) e non per un confronto
-// diretto tra istanze candidate come qui serve.
-//
-// [RIVISTO 17/10] Include ora anche il
-// termine di potenza idle ε_i (Eq. 7: "Ef = ϵi + τi·ψᶠᵢ + ϑi·(δf+δef)") —
-// la decisione del 02/10 di ignorarlo "in linea col paper originale" è
-// stata superata (vedi punto 5 in testa al file).
-//
-// [RISOLTO nel ricevimento del 22/10 con Cardellini/Cecilia/Russo Russo]
-// Nell'Eq. 7 del paper ε_i compare come termine additivo semplice, non
-// moltiplicato per execTimeSec — eppure la tabella delle notazioni lo
-// definisce come una POTENZA (W), non un'energia (J), la stessa unità di
-// τ_i che invece viene moltiplicato per il tempo. Confermata
-// l'incongruenza dimensionale già segnalata; il gruppo ha
-// deciso che nel codice il consumo energetico va calcolato correttamente
-// come Potenza × Tempo di esecuzione (in secondi) = Joule, quindi
-// idlePowerW * execTimeSec, non più la somma diretta "letterale"
-// precedentemente implementata in attesa di conferma.
-func energyJoules(c elCandidate, f *function.Function, execTimeSec float64) float64 {
-	const memoryUnitMB = 2048.0 // stessa costante di internal/emissions/emissions.go
-	cpuUsage := f.CPUDemand
-	if cpuUsage <= 0 {
-		cpuUsage = 1.0
+// outputBytes è la dimensione media dell'output di una funzione o variante
+// (metrica AvgOutputSize); per una variante senza misura si usa quella della
+// funzione base. 0 se non c'è nessuna misura.
+func outputBytes(name, baseFunc string) float64 {
+	sizes := metrics.GetMetrics().AvgOutputSize
+	if b, ok := sizes[name]; ok {
+		return b
 	}
-	computeEnergy := c.procPowerW * (float64(f.MemoryMB) / memoryUnitMB) * execTimeSec * cpuUsage
-	idleEnergy := idleEnergyJoules(c, execTimeSec) // ε_i, Eq. 7 — Potenza × Tempo = Joule, confermato 22/10 (vedi nota sopra)
-
-	outputBytes := metrics.GetMetrics().AvgOutputSize[f.Name]
-	// L'input non è propagato per-task (stesso limite di remote_offloading_policy.go,
-	// che usa r.ParamsSize come proxy per l'intero workflow); qui si usa la
-	// dimensione media di output come proxy anche per l'input quando non è
-	// il primo task, un'approssimazione grezza da rivedere.
-	inputBytes := outputBytes
-
-	transferEnergy := inputBytes*c.rxEnergyJPerByte + outputBytes*c.txEnergyJPerByte
-	if c.isLocal {
-		transferEnergy = 0 // nessun trasferimento di rete per l'esecuzione locale
-	}
-
-	return computeEnergy + idleEnergy + transferEnergy
+	return sizes[baseFunc]
 }
 
-// idleEnergyJoules è il termine idle dell'Eq. 7 (ε_i), scalato per il tempo di
-// esecuzione come deciso il 22/10. È incluso nell'energia (energyJoules) ma
-// escluso dalla CO2 (estimateOnCandidate, punto 19), come nel paper.
+// predecessorOutputBytes stima l'input di un task pronto a metà esecuzione:
+// la somma degli output medi dei FunctionTask che lo precedono (più di uno
+// per un join), 0 se non ce ne sono.
+func predecessorOutputBytes(w *Workflow, tid TaskId) float64 {
+	total := 0.0
+	for _, prev := range w.GetPreviousTasks(tid) {
+		if ft, ok := w.Tasks[prev].(*FunctionTask); ok {
+			total += outputBytes(ft.Func, ft.Func)
+		}
+	}
+	return total
+}
+
+// isLastFunctionTask dice se dopo ft, seguendo i task unari, si arriva alla
+// fine del workflow senza altri FunctionTask: in quel caso il suo risultato
+// torna all'origine. Davanti a un ChoiceTask o a un ParallelTask risponde
+// false (il ramo non è noto staticamente: sarà rivisto con quei punti).
+func isLastFunctionTask(w *Workflow, ft *FunctionTask) bool {
+	next := ft.GetNext()
+	for steps := 0; steps <= len(w.Tasks); steps++ {
+		if next == "" {
+			return true
+		}
+		switch t := w.Tasks[next].(type) {
+		case *FunctionTask:
+			return false
+		case *EndTask:
+			return true
+		case UnaryTask:
+			next = t.GetNext()
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// energyJoules è la traduzione dell'Eq. 7 del paper (E^f) usata nella
+// funzione obiettivo. Qui si scrive la formula per esteso, invece di
+// richiamare internal/emissions.Compute(), perché quella funzione è pensata
+// per il modello ad "edge aggregato" della policy CO2/QoS e non per un
+// confronto diretto tra istanze candidate.
+//
+// [DECISO 18/11 con il prof. Russo Russo, applicato 20/11 — punto 22]
+//   - Niente potenza idle ε_i: i nodi restano accesi comunque, quindi l'idle
+//     non dipende dalla decisione di scheduling e non deve influenzarla.
+//     Supera la decisione del 22/10 (idlePowerW * execTimeSec nell'energia).
+//     Per il consumo totale a posteriori resta idleEnergyJoules().
+//   - Ogni funzione usa 1 core CPU: energia di esecuzione = potenza di un core
+//     × tempo (corePowerW), al posto di procPowerW × memoria/2048 × CPUDemand.
+//
+// [20/11, punto 23] Contiene solo l'energia di ESECUZIONE: quella dei dati
+// (trasmissione/ricezione) si calcola tratta per tratta in transferEstimate()
+// ed estimateOnCandidate() la somma.
+func energyJoules(c elCandidate, execTimeSec float64) float64 {
+	return corePowerW(c) * execTimeSec
+}
+
+// corePowerW è la potenza di un singolo core del candidato (punto 22):
+// consumption.processing.power si riferisce all'intero nodo, quindi si divide
+// per il numero di core. Se il numero di core è sconosciuto (<= 0) si usa la
+// potenza del nodo intera, cioè si assume un nodo da 1 core: è il caso
+// prudente (sovrastima l'energia invece di azzerarla).
+func corePowerW(c elCandidate) float64 {
+	if c.cores > 0 {
+		return c.procPowerW / c.cores
+	}
+	return c.procPowerW
+}
+
+// idleEnergyJoules è l'energia idle ε_i × tempo. Dal 20/11 (punto 22) NON
+// entra nella funzione obiettivo né nella CO2: resta solo per calcolare a
+// posteriori il consumo totale effettivo negli esperimenti, come indicato dal
+// prof. Russo Russo il 18/11.
 func idleEnergyJoules(c elCandidate, execTimeSec float64) float64 {
 	return c.idlePowerW * execTimeSec
 }

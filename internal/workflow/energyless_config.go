@@ -58,6 +58,12 @@ type energyLessFileConfig struct {
 
 	// File con i valori misurati dal tuning (punto 20, energyless_tuning.go).
 	TuningFile *string `yaml:"tuning.file"`
+
+	// Numero di core di un nodo cloud (punto 22 in energyless_policy.go): la
+	// potenza di un core è consumption.processing.power / core. Per i nodi
+	// edge il numero di core arriva con l'heartbeat (TotalCPU) o da
+	// pool.cpus in locale; per il cloud non c'è questo dato.
+	CloudCores *float64 `yaml:"cloud.cores"`
 }
 
 // energyLessParams sono i parametri risolti (file > chiavi principali >
@@ -73,6 +79,7 @@ type energyLessParams struct {
 	defaultExecTime    float64 // secondi, ripiego senza metrica di esecuzione
 	defaultInitTime    float64 // secondi, ripiego senza metrica di init (cold start)
 	tuning             energyLessTuning
+	cloudCores         float64 // core di un nodo cloud, per la potenza di un core (punto 22)
 }
 
 // loadEnergyLessParams risolve i parametri della policy. Parte dai valori
@@ -95,6 +102,7 @@ func loadEnergyLessParams() energyLessParams {
 		cloudStorageCost:   config.GetFloat(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CLOUD_TO_DATA_STORE_STORAGE_COST, 0.0),
 		defaultExecTime:    defaultFallbackTime,
 		defaultInitTime:    defaultFallbackTime,
+		cloudCores:         defaultCloudCores,
 	}
 
 	path := config.GetString(config.WORKFLOW_OFFLOADING_POLICY_ENERGYLESS_CONFIG_PATH, "")
@@ -124,6 +132,7 @@ func loadEnergyLessParams() energyLessParams {
 	positive := func(v float64) bool { return v > 0 }
 	overrideFloat(&p.defaultExecTime, fc.DefaultExecTime, "default.exec.time", positive)
 	overrideFloat(&p.defaultInitTime, fc.DefaultInitTime, "default.init.time", positive)
+	overrideFloat(&p.cloudCores, fc.CloudCores, "cloud.cores", positive)
 	overrideFloat(&p.defaultMinAccuracy, fc.DefaultMinAccuracy, "default.min.accuracy",
 		func(v float64) bool { return v > 0 && v <= 1 })
 
@@ -184,6 +193,6 @@ func logEnergyLessParams(p energyLessParams, path string) {
 	if path != "" {
 		source = "file " + path
 	}
-	log.Printf("EnergyLess: parameters from %s: weights(time=%.3g energy=%.3g carbon=%.3g cost=%.3g) placementTTL=%d defaultMinAccuracy=%.3g defaultExecTime=%.3gs defaultInitTime=%.3gs",
-		source, p.weights.time, p.weights.energy, p.weights.carbon, p.weights.cost, p.placementTTL, p.defaultMinAccuracy, p.defaultExecTime, p.defaultInitTime)
+	log.Printf("EnergyLess: parameters from %s: weights(time=%.3g energy=%.3g carbon=%.3g cost=%.3g) placementTTL=%d defaultMinAccuracy=%.3g defaultExecTime=%.3gs defaultInitTime=%.3gs cloudCores=%.3g",
+		source, p.weights.time, p.weights.energy, p.weights.carbon, p.weights.cost, p.placementTTL, p.defaultMinAccuracy, p.defaultExecTime, p.defaultInitTime, p.cloudCores)
 }
