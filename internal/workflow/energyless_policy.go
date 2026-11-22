@@ -344,7 +344,49 @@
 //     Limiti noti: due rami sullo stesso nodo sono stimati come se non si
 //     contendessero le risorse (tabella delle prenotazioni, punto 7 della
 //     lista del 18/11); un ChoiceTask dentro un ramo ferma la visita, quindi
-//     il join e i task successivi restano fuori dal piano (punto 5).
+//     il join e i task successivi restano fuori dal piano fino alla
+//     ripianificazione dopo il ChoiceTask (punto 27).
+//  25. [21/11] Pulizia della cache dei piani. Ogni richiesta salvava il suo
+//     piano in policy.cache con un TTL di placement.ttl letture (9999), che
+//     una richiesta non consuma mai: la voce restava in memoria per sempre e
+//     in un esperimento lungo la cache cresceva senza limite. Ora la voce
+//     viene eliminata quando la richiesta termina sul nodo di origine, con
+//     successo o con errore, tramite l'interfaccia opzionale
+//     RequestCompletionListener (offloading_policy.go), chiamata da
+//     Workflow.Invoke() (workflow.go) solo se r.CanDoOffloading. Le altre
+//     policy non la implementano e non cambiano comportamento.
+//  26. [DECISO 18/11 con il prof. Russo Russo, applicato 22/11] Due contatori
+//     delle richieste di workflow pianificate da questo nodo: (1) completate
+//     (workflow terminato senza errori) e (2) completate rispettando anche la
+//     deadline (tempo di risposta <= QoS.MaxRespT, misurato come fa l'API da
+//     r.Arrival). Le richieste con errore sono contate a parte. Aggiornati in
+//     RequestCompleted() (RequestCompletionListener, che dal 22/11 riceve
+//     anche l'errore di Invoke) e scritti nel log a ogni richiesta; Stats()
+//     li restituisce. Ripartono da zero a ogni avvio del nodo. La deadline è
+//     della richiesta, non della singola funzione: per questo si contano le
+//     richieste (come indicato anche da Cecilia l'11/11).
+//  27. [APPROVATO 18/11 dal prof. Russo Russo, applicato 22/11]
+//     Ripianificazione dopo un ChoiceTask. Il ChoiceTask, come gli altri task
+//     strutturali, non entra mai nel piano remoto: lo esegue l'origine, che
+//     sceglie il ramo e segna Skipped i task dei rami non scelti. La visita
+//     di buildPlan() si ferma al ChoiceTask, quindi prima i task del ramo
+//     scelto restavano fuori dal piano e giravano in locale. Ora la cache
+//     ricorda anche i task visitati: quando tra i task pronti ce n'è uno mai
+//     visitato (il primo del ramo scelto), evaluate() pianifica solo da lì
+//     in avanti e aggiunge il risultato al piano (mergePlans), senza toccare
+//     i task già pianificati (coerente col punto 21). La deadline residua si
+//     ricalcola dall'istante della ripianificazione; la soglia di accuratezza
+//     parte dal prodotto delle accuratezze già scelte (chosenAccuracy); le
+//     varianti dei nuovi task si aggiungono a r.Variants, che
+//     FunctionTask.resolveVariant ora legge sotto r.mu. Join dopo un fork con
+//     un ChoiceTask in un ramo: un task si pianifica solo quando tutti i suoi
+//     predecessori nel grafo sono eseguiti, scartati, già pianificati o
+//     raggiunti dalla visita; altrimenti (predecessore dietro un ChoiceTask
+//     non ancora eseguito) resta fuori dal piano con tutto ciò che lo segue.
+//     Così il join viene pianificato solo nella ripianificazione dopo il
+//     ChoiceTask, con gli input di tutti i rami: quelli già pianificati
+//     prima arrivano dal nodo scelto allora (knownPlacement), il loro tempo
+//     non ritarda il join (già passato o in parallelo).
 package workflow
 
 import (
@@ -357,6 +399,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/serverledge-faas/serverledge/internal/config"
@@ -415,6 +458,11 @@ type energyLessWeights struct {
 type energyLessCacheEntry struct {
 	placement map[TaskId]*elEstimate
 	ttl       int
+	// visited: task raggiunti dalla visita di buildPlan() (anche quelli non
+	// posizionati: strutturali, fuori dal piano). Un task pronto che non c'è
+	// è il primo di un ramo scelto da un ChoiceTask dopo la pianificazione:
+	// fa scattare la ripianificazione incrementale (punto 27).
+	visited map[TaskId]bool
 }
 
 // EnergyLessPolicy implementa OffloadingPolicy (offloading_policy.go)
@@ -450,6 +498,15 @@ type EnergyLessPolicy struct {
 	// Core di un nodo cloud (punto 22): da cloud.cores nel file della policy,
 	// altrimenti defaultCloudCores.
 	cloudCores float64
+
+	// Contatori delle richieste pianificate da questo nodo (punto 26),
+	// aggiornati da RequestCompleted; atomici perché le richieste terminano
+	// in goroutine diverse. Ripartono da zero a ogni avvio del nodo.
+	stats struct {
+		completed      atomic.Uint64
+		withinDeadline atomic.Uint64
+		failed         atomic.Uint64
+	}
 
 	// cloudCO2Mu/lastKnownCloudCO2/hasLastKnownCloudCO2: fallback per la
 	// query live della CO2Intensity del cloud (vedi gatherCandidates()).
@@ -549,6 +606,11 @@ type elEstimate struct {
 	cost           float64       // Z^f = CC^f + CT^f + CS^f, Eq. 13+14+15
 	accuracy       float64       // ∈[0,1], [NUOVO 30/10] accuratezza della funzione/variante scelta rispetto a quella richiesta dal task: 1.0 per la funzione del task, Function.Utility per una variante sostituta (vedi selectBest)
 	objective      float64       // somma pesata normalizzata, Eq. 22
+	// timeSource: da dove viene il tempo di esecuzione stimato — "misura"
+	// (metrica di Prometheus, via Pushgateway), "tuning" (file del tuning,
+	// punto 20), "speedup" (variante senza misura: tempo della base diviso
+	// SpeedUp) o "default" (default.exec.time). Mostrato nel log del piano.
+	timeSource string
 }
 
 // defaultCloudCores è il numero di core di un nodo cloud quando il file della
@@ -622,31 +684,58 @@ func (policy *EnergyLessPolicy) evaluate(r *Request, p *Progress) ([]OffloadingD
 
 	// Piano in cache (punto 6): se esiste già un placement valido per questa
 	// richiesta, lo si usa direttamente senza ricalcolare nulla.
-	placement, ok := policy.getCachedPlan(r.Id)
+	residualDeadline := func() float64 {
+		if r.QoS.MaxRespT > 0.0 {
+			return r.QoS.MaxRespT - time.Since(r.Arrival).Seconds()
+		}
+		return math.Inf(1)
+	}
+
+	placement, visited, ok := policy.getCachedPlan(r.Id)
 	if !ok {
 		candidates := policy.gatherCandidates()
 		if len(candidates) == 0 {
 			return noOffload, nil
 		}
-
-		residualDeadline := math.Inf(1)
-		if r.QoS.MaxRespT > 0.0 {
-			residualDeadline = r.QoS.MaxRespT - time.Since(r.Arrival).Seconds()
-		}
-
 		// Calcola il placement per TUTTI i task non ancora eseguiti
 		// raggiungibili (catene e rami di fork-join, punto 24), una sola
 		// volta, e lo cachea.
-		placement = policy.buildPlan(r, p, candidates, residualDeadline)
-		policy.cacheSolution(r.Id, placement)
+		placement, visited = policy.buildPlan(r, p, candidates, residualDeadline(), p.ReadyToExecute, 1.0, nil, nil)
+		policy.cacheSolution(r.Id, placement, visited)
+	} else if fresh := unvisitedReadyTasks(p, visited); len(fresh) > 0 {
+		// [NUOVO 22/11, punto 27 — approvato il 18/11 dal prof. Russo Russo]
+		// Ripianificazione dopo un ChoiceTask: la visita del piano si era
+		// fermata al ChoiceTask (il ramo si conosce solo a runtime). Ora il
+		// ChoiceTask è stato eseguito sull'origine, i rami non scelti sono
+		// Skipped e il primo task del ramo scelto è pronto ma non è mai stato
+		// visitato. Si pianifica SOLO da lì in avanti e si AGGIUNGE al piano:
+		// i task già pianificati non cambiano (coerente col punto 21). La
+		// deadline residua si ricalcola da adesso; la soglia di accuratezza
+		// parte dal prodotto delle accuratezze già scelte.
+		candidates := policy.gatherCandidates()
+		if len(candidates) > 0 {
+			added, addedVisited := policy.buildPlan(r, p, candidates, residualDeadline(), fresh, chosenAccuracy(p, placement), visited, placement)
+			placement, visited = mergePlans(placement, visited, added, addedVisited)
+			policy.cacheSolution(r.Id, placement, visited)
+			log.Printf("EnergyLess: richiesta %s, ripianificazione dopo un ChoiceTask dai task %v: %d task aggiunti al piano (totale %d)",
+				r.Id, fresh, len(added), len(placement))
+		}
 	}
 
-	// Varianti scelte (punto 16): scritte una sola volta per richiesta, quando
-	// il campo non è ancora valorizzato, così non ci sono scritture
-	// concorrenti con i task già in esecuzione. variantChoices ritorna sempre
-	// una mappa non nil, anche se vuota.
+	// Varianti scelte (punto 16). Al primo piano si crea la mappa; dopo una
+	// ripianificazione (punto 27) si AGGIUNGONO le varianti dei nuovi task,
+	// senza cambiare quelle esistenti. Evaluate() gira con r.mu bloccato e
+	// FunctionTask.resolveVariant legge la mappa sotto lo stesso lock, quindi
+	// non ci sono accessi concorrenti. variantChoices ritorna sempre una mappa
+	// non nil, anche se vuota.
 	if r.Variants == nil {
 		r.Variants = variantChoices(r.W, placement)
+	} else {
+		for tid, v := range variantChoices(r.W, placement) {
+			if _, set := r.Variants[tid]; !set {
+				r.Variants[tid] = v
+			}
+		}
 	}
 
 	return policy.computeDecisionsFromPlacement(p, placement, r.Variants), nil
@@ -684,14 +773,16 @@ func variantChoices(w *Workflow, placement map[TaskId]*elEstimate) map[TaskId]st
 // non-FunctionTask (es. ChoiceTask la cui diramazione non è ancora nota),
 // quando NextTask è vuoto, o se un task è già stato visitato (protezione
 // da cicli).
-func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []elCandidate, residualDeadline float64) map[TaskId]*elEstimate {
+func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []elCandidate, residualDeadline float64, startTasks []TaskId, startAccuracy float64, known map[TaskId]bool, knownPlacement map[TaskId]*elEstimate) (map[TaskId]*elEstimate, map[TaskId]bool) {
 	placement := make(map[TaskId]*elEstimate)
 
 	// Ranking dei task pronti (righe 6-12, Alg. 1): r_f = tempo medio
 	// stimato sulle istanze candidate. Dà l'ordine con cui si visitano i
 	// task pronti nello stesso istante (per esempio i rami di un fork).
 	// NOTA: non propaga ancora il rank dei predecessori (riga 11).
-	ready := policy.rankReadyTasks(r, p, candidates)
+	// startTasks: al primo piano i task pronti; dopo un ChoiceTask (punto
+	// 27) solo i task pronti mai visitati (il ramo scelto).
+	ready := policy.rankReadyTasks(r, startTasks, candidates)
 
 	// [NUOVO 21/11, punto 24] Visita in ordine topologico del grafo da
 	// pianificare: si seguono GetNext() dei task unari e GetBranches() dei
@@ -737,7 +828,10 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 	// la scelta resta greedy per task (come l'Alg. 1), vedi punto 8 della
 	// lista del 18/11 (fattore correttivo).
 	minAccuracy := policy.minAccuracyThreshold(r)
-	accChain := 1.0
+	// startAccuracy: 1 al primo piano; in una ripianificazione (punto 27) il
+	// prodotto delle accuratezze già scelte, così il vincolo resta sul
+	// prodotto dell'intero workflow.
+	accChain := startAccuracy
 
 	// deadlineAtRisk: il piano prevede già di sforare la deadline (punti 17 e
 	// 21), usato solo per loggarlo una volta per piano.
@@ -764,6 +858,52 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 	// Tratte già pagate (energia, CO2, costo) dai task posizionati finora
 	// (correzione del doppio conteggio, 21/11).
 	shipped := make(map[string]bool)
+
+	// [NUOVO 22/11, punto 27 — join dopo un ChoiceTask] Un task si pianifica
+	// solo quando TUTTI i suoi predecessori nel grafo sono a posto, non solo
+	// quelli raggiunti da questa visita. Per ogni predecessore non raggiunto:
+	//   - già eseguito, o già visitato da una pianificazione precedente
+	//     (known): il suo output è sull'origine (il nodo che lo ha prodotto lo
+	//     ha restituito a fine segmento, perché il task non era ancora
+	//     eseguibile) e arriva insieme alla richiesta di offloading; entra tra
+	//     gli input come "earlier". Il suo tempo non ritarda il task (è già
+	//     passato o scorre in parallelo);
+	//   - scartato da un ChoiceTask (Skipped): nessun dato;
+	//   - altrimenti è dietro un ChoiceTask non ancora eseguito: il task è
+	//     BLOCCATO e resta fuori dal piano, con tutto ciò che lo segue, fino
+	//     alla ripianificazione dopo quel ChoiceTask.
+	// Prima un join con un ramo dietro un ChoiceTask veniva pianificato già al
+	// primo piano, come se dipendesse solo dagli altri rami (inizio e dati
+	// stimati per difetto), e la ripianificazione non lo correggeva più.
+	isStart := make(map[TaskId]bool, len(ready))
+	for _, tid := range ready {
+		isStart[tid] = true
+	}
+	blocked := make(map[TaskId]bool)
+	for tid := range reached {
+		if isStart[tid] {
+			continue
+		}
+		for _, prev := range r.W.GetPreviousTasks(tid) {
+			if reached[prev] {
+				continue // contato in pending: si aspetta che venga pianificato
+			}
+			switch {
+			case p.Status[prev] == Skipped:
+			case p.Status[prev] == Executed, known[prev]:
+				// Prodotto prima di questa pianificazione: il suo output è già
+				// (o sarà, a fine del suo segmento) sull'origine e arriva al
+				// nodo del task insieme alla richiesta di offloading.
+				bytes := taskOutputBytes(r.W, prev)
+				if est, placed := knownPlacement[prev]; placed {
+					bytes = outputBytes(est.functionName, taskFunctionName(r.W, prev))
+				}
+				inputsOf[tid] = append(inputsOf[tid], elDataSource{loc: origin, bytes: bytes, producer: prev, item: prev, earlier: true})
+			default:
+				blocked[tid] = true
+			}
+		}
+	}
 
 	visited := make(map[TaskId]bool)
 	for len(ready) > 0 {
@@ -811,14 +951,14 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 				inputsOf[s] = append(inputsOf[s], out)
 			}
 			pending[s]--
-			if pending[s] == 0 {
+			if pending[s] == 0 && !blocked[s] {
 				ready = append(ready, s)
 			}
 		}
 	}
 
 	logPlan(r.Id, placement, makespan, residualDeadline)
-	return placement
+	return placement, visited
 }
 
 // placeFunctionTask sceglie la coppia nodo-funzione/variante per un
@@ -885,7 +1025,8 @@ func (policy *EnergyLessPolicy) placeFunctionTask(r *Request, tid TaskId, ft *Fu
 // planSuccessors sono i task da visitare dopo t nella pianificazione
 // statica (punto 24): il successore di un task unario, i rami di un
 // FanOutTask; nessuno per un ConditionalTask (il ramo si conosce solo a
-// runtime, punto 5 della lista del 18/11) e per la fine del workflow.
+// runtime: lo si pianifica dopo l'esecuzione del ChoiceTask, punto 27) e per
+// la fine del workflow.
 func planSuccessors(t Task) []TaskId {
 	switch tt := t.(type) {
 	case UnaryTask:
@@ -924,7 +1065,7 @@ func logPlan(reqId string, placement map[TaskId]*elEstimate, chainSec float64, r
 	parts := make([]string, 0, len(ids))
 	for _, tid := range ids {
 		est := placement[tid]
-		parts = append(parts, fmt.Sprintf("%s->%s/%s %.3fs %.1fJ", tid, est.candidate.key, est.functionName, est.completionTime.Seconds(), est.energyJoules))
+		parts = append(parts, fmt.Sprintf("%s->%s/%s %.3fs[%s] %.1fJ", tid, est.candidate.key, est.functionName, est.completionTime.Seconds(), est.timeSource, est.energyJoules))
 	}
 	deadline := "nessuna"
 	if !math.IsInf(residualDeadline, 1) {
@@ -1015,48 +1156,156 @@ func (policy *EnergyLessPolicy) computeDecisionsFromPlacement(p *Progress, place
 // diverso (map[TaskId]*elEstimate qui, taskPlacement=map[TaskId]string
 // nell'originale), quindi un refactor verso un helper generico condiviso
 // resta possibile ma non fatto qui — vedi "Domande ancora aperte".
-func (policy *EnergyLessPolicy) cacheSolution(requestId string, placement map[TaskId]*elEstimate) {
+func (policy *EnergyLessPolicy) cacheSolution(requestId string, placement map[TaskId]*elEstimate, visited map[TaskId]bool) {
 	policy.cacheMu.Lock()
 	defer policy.cacheMu.Unlock()
 	policy.cache[requestId] = &energyLessCacheEntry{
 		placement: placement,
 		ttl:       policy.cacheTTLInit,
+		visited:   visited,
 	}
 }
 
-func (policy *EnergyLessPolicy) getCachedPlan(requestId string) (map[TaskId]*elEstimate, bool) {
+// Controllo a tempo di compilazione: la policy implementa l'interfaccia.
+var _ RequestCompletionListener = (*EnergyLessPolicy)(nil)
+
+// RequestCompleted implementa RequestCompletionListener (offloading_policy.go)
+// ed è chiamata quando una richiesta termina sul nodo di origine, con
+// successo o con errore (err != nil).
+//
+// [NUOVO 21/11, punto 25] Elimina la voce della richiesta dalla cache dei
+// piani: prima restava in memoria per sempre (TTL di 9999 letture, che una
+// richiesta non consuma mai).
+//
+// [NUOVO 22/11, punto 26 — deciso il 18/11 con il prof. Russo Russo]
+// Aggiorna i due contatori delle richieste: completate (workflow terminato
+// senza errori) e completate rispettando anche la deadline (tempo di
+// risposta <= QoS.MaxRespT, misurato da r.Arrival come fa l'API). Una
+// richiesta senza deadline (MaxRespT <= 0) conta come rispettata. Le
+// richieste terminate con errore non entrano in nessuno dei due e sono
+// contate a parte.
+func (policy *EnergyLessPolicy) RequestCompleted(r *Request, err error) {
+	policy.cacheMu.Lock()
+	delete(policy.cache, r.Id)
+	remaining := len(policy.cache)
+	policy.cacheMu.Unlock()
+
+	respT := time.Since(r.Arrival).Seconds()
+	deadline := r.QoS.MaxRespT
+	outcome := ""
+	switch {
+	case err != nil:
+		policy.stats.failed.Add(1)
+		outcome = fmt.Sprintf("terminata con errore (%v)", err)
+	case deadline <= 0:
+		policy.stats.completed.Add(1)
+		policy.stats.withinDeadline.Add(1)
+		outcome = fmt.Sprintf("completata in %.3fs (nessuna deadline)", respT)
+	case respT <= deadline:
+		policy.stats.completed.Add(1)
+		policy.stats.withinDeadline.Add(1)
+		outcome = fmt.Sprintf("completata in %.3fs, deadline %.3fs rispettata", respT, deadline)
+	default:
+		policy.stats.completed.Add(1)
+		outcome = fmt.Sprintf("completata in %.3fs, deadline %.3fs NON rispettata", respT, deadline)
+	}
+	completed, within, failed := policy.Stats()
+	pct := 0.0
+	if completed > 0 {
+		pct = 100 * float64(within) / float64(completed)
+	}
+	log.Printf("EnergyLess: richiesta %s %s | contatori: completate %d, entro la deadline %d (%.1f%%), con errore %d | piani in cache: %d",
+		r.Id, outcome, completed, within, pct, failed, remaining)
+}
+
+// Stats restituisce i contatori delle richieste dall'avvio del nodo (punto
+// 26): completate, completate entro la deadline, terminate con errore.
+func (policy *EnergyLessPolicy) Stats() (completed, withinDeadline, failed uint64) {
+	return policy.stats.completed.Load(), policy.stats.withinDeadline.Load(), policy.stats.failed.Load()
+}
+
+func (policy *EnergyLessPolicy) getCachedPlan(requestId string) (map[TaskId]*elEstimate, map[TaskId]bool, bool) {
 	policy.cacheMu.Lock()
 	defer policy.cacheMu.Unlock()
 
 	entry, found := policy.cache[requestId]
 	if !found {
-		return nil, false
+		return nil, nil, false
 	}
 
 	// Stesso comportamento di getCachedSolution: la entry si consuma una
 	// lettura per volta; quando il contatore arriva a 0 viene eliminata.
 	if entry.ttl > 0 {
 		entry.ttl--
-		return entry.placement, true
+		return entry.placement, entry.visited, true
 	}
 
 	delete(policy.cache, requestId)
-	return nil, false
+	return nil, nil, false
+}
+
+// unvisitedReadyTasks sono i task pronti e ancora da eseguire che la visita
+// di buildPlan() non ha mai raggiunto: il primo task del ramo scelto da un
+// ChoiceTask eseguito dopo la pianificazione (punto 27).
+func unvisitedReadyTasks(p *Progress, visited map[TaskId]bool) []TaskId {
+	var fresh []TaskId
+	for _, tid := range p.ReadyToExecute {
+		if !visited[tid] && p.Status[tid] == Pending {
+			fresh = append(fresh, tid)
+		}
+	}
+	return fresh
+}
+
+// chosenAccuracy è il prodotto delle accuratezze già scelte nel piano per i
+// task che non sono stati scartati da un ChoiceTask (Skipped): il punto di
+// partenza del vincolo di accuratezza in una ripianificazione (punto 27).
+func chosenAccuracy(p *Progress, placement map[TaskId]*elEstimate) float64 {
+	acc := 1.0
+	for tid, est := range placement {
+		if p.Status[tid] != Skipped {
+			acc *= est.accuracy
+		}
+	}
+	return acc
+}
+
+// mergePlans aggiunge al piano esistente i task di una ripianificazione,
+// senza sostituire quelli già presenti (punto 27, coerente col punto 21).
+// Restituisce mappe nuove: quelle in cache non vengono modificate.
+func mergePlans(placement map[TaskId]*elEstimate, visited map[TaskId]bool, added map[TaskId]*elEstimate, addedVisited map[TaskId]bool) (map[TaskId]*elEstimate, map[TaskId]bool) {
+	mp := make(map[TaskId]*elEstimate, len(placement)+len(added))
+	for tid, est := range placement {
+		mp[tid] = est
+	}
+	for tid, est := range added {
+		if _, exists := mp[tid]; !exists {
+			mp[tid] = est
+		}
+	}
+	mv := make(map[TaskId]bool, len(visited)+len(addedVisited))
+	for tid := range visited {
+		mv[tid] = true
+	}
+	for tid := range addedVisited {
+		mv[tid] = true
+	}
+	return mp, mv
 }
 
 // rankReadyTasks ordina i task pronti per rank decrescente (tempo medio
 // stimato più alto = priorità più alta, stile HEFT/upward-rank).
 // Ranking dei task pronti (righe 6-12, Alg. 1): r_f = tempo medio
 // stimato sulle istanze candidate.
-func (policy *EnergyLessPolicy) rankReadyTasks(r *Request, p *Progress, candidates []elCandidate) []TaskId {
+func (policy *EnergyLessPolicy) rankReadyTasks(r *Request, tasks []TaskId, candidates []elCandidate) []TaskId {
 	type ranked struct {
 		id   TaskId
 		rank float64
 	}
 	rm := metrics.GetMetrics()
-	ranks := make([]ranked, 0, len(p.ReadyToExecute))
+	ranks := make([]ranked, 0, len(tasks))
 
-	for _, tid := range p.ReadyToExecute {
+	for _, tid := range tasks {
 		ft, isFunc := r.W.Tasks[tid].(*FunctionTask)
 		if !isFunc {
 			ranks = append(ranks, ranked{id: tid, rank: 0})
@@ -1407,19 +1656,29 @@ func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics,
 		}
 	}
 
+	// Priorità del tempo di esecuzione (21/11, resa visibile nel log):
+	// 1) misura live di Prometheus per quel nodo e quella funzione (serve il
+	//    Pushgateway: è lui ad aggiungere l'etichetta node alle metriche);
+	// 2) misura del tuning salvata su file (punto 20);
+	// 3) ripiego: base/SpeedUp per una variante, default.exec.time per la
+	//    funzione base.
+	timeSource := "misura"
 	execTime = estimateExecTime(rm, c, metricName)
 	tv, tuned := policy.tuning.lookup(c, metricName)
 	if execTime <= 0 && tuned && tv.execTime > 0 {
-		// [NUOVO 16/11, punto 20] Nessuna metrica live: misura del tuning
-		// salvata su file, prima del ripiego (base/SpeedUp per una
-		// variante, default.exec.time per la funzione base).
 		execTime = tv.execTime
+		timeSource = "tuning"
 	}
 	if execTime <= 0 {
 		execTime = fallbackExecTime
+		timeSource = "speedup"
+		if metricName == flow.baseFunc {
+			timeSource = "default"
+		}
 	}
 	if execTime <= 0 {
 		execTime = policy.fallbackExecTime()
+		timeSource = "default"
 	}
 
 	// Cold start (λ_i^f, Eq. 2): tempo di init ATTESO, già pesato per la
@@ -1479,6 +1738,7 @@ func (policy *EnergyLessPolicy) estimateOnCandidate(rm metrics.RetrievedMetrics,
 		energyJoules:   energyJ,
 		carbonGrams:    carbonG,
 		cost:           cost,
+		timeSource:     timeSource,
 	}, true
 }
 
@@ -1565,6 +1825,13 @@ type elDataSource struct {
 	// usano più task offloadati insieme).
 	producer TaskId
 	item     TaskId
+	// earlier: dato prodotto PRIMA di questa pianificazione (task già
+	// eseguito o pianificato in precedenza, punto 27). Il nodo che lo ha
+	// prodotto lo ha già restituito all'origine, che lo invia insieme alla
+	// richiesta di offloading (prepareOffloadData manda gli output dei
+	// predecessori di tutti i task del piano del nodo): pesa solo la tratta
+	// origine -> nodo e non costringe gli altri input a tornare all'origine.
+	earlier bool
 }
 
 // elDataFlow descrive i dati che un task deve ricevere e restituire, per
@@ -1631,17 +1898,39 @@ func (policy *EnergyLessPolicy) transferEstimate(flow elDataFlow, c elCandidate,
 	// quindi restituisce i propri output all'origine: ogni input che sta su
 	// un nodo diverso dall'origine fa la tratta verso l'origine, e poi
 	// l'origine invia a c tutti gli input insieme.
+	//
+	// [22/11, punto 27] Gli input "earlier" (prodotti prima di questa
+	// pianificazione) sono già sull'origine e viaggiano con la richiesta: non
+	// impediscono agli altri input di restare sul nodo; pesano solo nella
+	// tratta origine -> c.
 	local := true
+	var earlierBytes, earlierUnpaid float64
+	var earlierKeys []string
 	for _, in := range flow.inputs {
+		if in.earlier {
+			sendKey := "send|" + string(in.item) + "|" + c.key
+			earlierBytes += in.bytes
+			if !paid(sendKey) {
+				earlierUnpaid += in.bytes
+			}
+			earlierKeys = append(earlierKeys, sendKey)
+			continue
+		}
 		if in.loc.key != c.key || in.viaOrigin {
 			local = false
-			break
 		}
 	}
-	if !local {
-		var toC, toCUnpaid float64
-		var sendKeys []string
+	if local {
+		if earlierBytes > 0 && c.key != flow.origin.key && !add(flow.origin, c, earlierBytes, earlierUnpaid, earlierKeys) {
+			return total, false
+		}
+	} else {
+		toC, toCUnpaid := earlierBytes, earlierUnpaid
+		sendKeys := append([]string(nil), earlierKeys...)
 		for _, in := range flow.inputs {
+			if in.earlier {
+				continue
+			}
 			if in.loc.key != flow.origin.key {
 				// Ritorno all'origine dell'output di in.producer: una sola
 				// volta, qualunque sia il numero di task che lo usano.
@@ -1741,10 +2030,45 @@ func outputBytes(name, baseFunc string) float64 {
 // la somma degli output medi dei FunctionTask che lo precedono (più di uno
 // per un join), 0 se non ce ne sono.
 func predecessorOutputBytes(w *Workflow, tid TaskId) float64 {
+	return predecessorOutputBytesSeen(w, tid, make(map[TaskId]bool))
+}
+
+// taskOutputBytes è la dimensione media dell'output di un task: quella della
+// sua funzione per un FunctionTask, l'input passato invariato per un task
+// strutturale (punto 27).
+func taskOutputBytes(w *Workflow, tid TaskId) float64 {
+	if ft, ok := w.Tasks[tid].(*FunctionTask); ok {
+		return outputBytes(ft.Func, ft.Func)
+	}
+	return predecessorOutputBytes(w, tid)
+}
+
+// taskFunctionName è la funzione base di un FunctionTask ("" per gli altri).
+func taskFunctionName(w *Workflow, tid TaskId) string {
+	if ft, ok := w.Tasks[tid].(*FunctionTask); ok {
+		return ft.Func
+	}
+	return ""
+}
+
+// predecessorOutputBytesSeen risale anche attraverso i task strutturali
+// (ChoiceTask, Pass, Fork), che passano i dati senza modificarli: il primo
+// task del ramo scelto da un ChoiceTask riceve l'output della funzione che
+// precede il ChoiceTask (punto 27).
+func predecessorOutputBytesSeen(w *Workflow, tid TaskId, seen map[TaskId]bool) float64 {
 	total := 0.0
 	for _, prev := range w.GetPreviousTasks(tid) {
-		if ft, ok := w.Tasks[prev].(*FunctionTask); ok {
-			total += outputBytes(ft.Func, ft.Func)
+		if seen[prev] {
+			continue
+		}
+		seen[prev] = true
+		switch t := w.Tasks[prev].(type) {
+		case *FunctionTask:
+			total += outputBytes(t.Func, t.Func)
+		case *StartTask:
+			// parametri della richiesta: non noti qui, trascurati
+		default:
+			total += predecessorOutputBytesSeen(w, prev, seen)
 		}
 	}
 	return total

@@ -163,7 +163,13 @@ func (s *FunctionTask) exec(compRequest *Request, params ...map[string]interface
 // funzione, signature diversa) non blocca l'esecuzione: si ripiega sulla base e
 // lo si scrive nel log.
 func (s *FunctionTask) resolveVariant(compRequest *Request, base *function.Function) *function.Function {
+	// Lettura sotto r.mu: la policy può aggiungere varianti alla mappa dopo
+	// una ripianificazione (EnergyLess, punto 27) mentre altri task della
+	// stessa richiesta sono in esecuzione; Evaluate() gira con lo stesso lock.
+	compRequest.mu.Lock()
 	name := compRequest.Variants[s.Id]
+	compRequest.mu.Unlock()
+
 	if name == "" || name == base.Name {
 		return base
 	}

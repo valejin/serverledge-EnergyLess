@@ -474,11 +474,21 @@ func (o offloadExecutionResult) TaskID() TaskId { return o.jobId }
 func (o offloadExecutionResult) Error() error   { return o.err }
 
 // Invoke schedules each function of the workflow and invokes them
-func (wflow *Workflow) Invoke(r *Request) error {
+func (wflow *Workflow) Invoke(r *Request) (invokeErr error) {
 	//alwaysSaveProgress := config.GetBool(config.WORKFLOW_ALWAYS_SAVE_PROGRESS, false)
 
 	requestId := ReqId(r.Id)
 	var err error
+
+	// Let the policy release per-request state (e.g., cached plans) when the
+	// request ends on the node that plans it (remote resumes cannot offload).
+	if r.CanDoOffloading {
+		if listener, ok := offloadingPolicy.(RequestCompletionListener); ok {
+			// invokeErr is the named result: the deferred call sees the error
+			// actually returned by Invoke.
+			defer func() { listener.RequestCompleted(r, invokeErr) }()
+		}
+	}
 
 	progress := wflow.initializeOrRetrieveProgress(r)
 

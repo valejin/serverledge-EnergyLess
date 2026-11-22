@@ -11,6 +11,16 @@ type OffloadingPolicy interface {
 	Evaluate(r *Request, p *Progress, runningTasks map[TaskId]bool) ([]OffloadingDecision, error)
 }
 
+// RequestCompletionListener is an optional interface for offloading policies
+// that keep per-request state (e.g., a cached plan) or per-request statistics.
+// If the configured policy implements it, Invoke calls RequestCompleted on the
+// node where the request was submitted (the one that plans) when the workflow
+// execution ends: err is nil if the workflow completed successfully, otherwise
+// it is the error returned by Invoke.
+type RequestCompletionListener interface {
+	RequestCompleted(r *Request, err error)
+}
+
 type OffloadingPlan struct {
 	ToExecute []TaskId
 	// Variants: variante da eseguire per i task di ToExecute che non usano la
