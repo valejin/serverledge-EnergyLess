@@ -387,6 +387,43 @@
 //     ChoiceTask, con gli input di tutti i rami: quelli già pianificati
 //     prima arrivano dal nodo scelto allora (knownPlacement), il loro tempo
 //     non ritarda il join (già passato o in parallelo).
+//  28. [DECISO 18/11 con il prof. Russo Russo, applicato 23/11] Tabella delle
+//     risorse prenotate. Le risorse dei vicini arrivano con nearbyMonitoring
+//     ogni registry.nearby.interval (20 s di default): richieste ravvicinate,
+//     e i rami paralleli di una stessa richiesta, vedevano lo stesso nodo
+//     libero. Inoltre ogni richiesta di workflow gira nella propria goroutine
+//     e chiama Evaluate() sulla stessa istanza della policy: due richieste
+//     potevano pianificare nello stesso istante. Ora:
+//     - planMu serializza la pianificazione (primo piano e ripianificazioni
+//     dopo un ChoiceTask): come uno scheduler unico, una richiesta alla
+//     volta legge lo stato e prenota;
+//     - ogni task posizionato su un nodo edge prenota memoria e CPU della
+//     funzione scelta nell'intervallo stimato [inizio, fine) (il cloud non
+//     si prenota: capacità infinita);
+//     - la capacità di un candidato per un task è lo stato letto meno le
+//     prenotazioni attive all'istante di inizio stimato del task: i task in
+//     catena non si sommano (riusano il core), i rami paralleli e le
+//     richieste concorrenti sì;
+//     - a ogni pianificazione si tolgono le prenotazioni scadute, quelle già
+//     iniziate sul nodo locale (stato in tempo reale) e quelle iniziate
+//     prima dell'ultimo heartbeat del vicino (lo stato le include già):
+//     restano solo quelle future; RequestCompleted toglie quelle della
+//     richiesta terminata.
+//     Limite: la tabella è del nodo che pianifica; richieste ricevute da nodi
+//     di origine diversi verso lo stesso vicino si vedono solo tramite
+//     l'heartbeat.
+//     [CONFERMATO 24/11 dal prof. Russo Russo] (a) il mutex va bene: conta
+//     che pianificazione e prenotazione siano atomiche, non l'ordine di
+//     arrivo (una coda FIFO stretta non cambierebbe i risultati); anche la
+//     ripianificazione dopo un ChoiceTask prende planMu (evaluate: lock se
+//     manca il piano o ci sono task pronti mai visitati). (b) Reset parziale
+//     preferito al reset totale. (c) De-allocazione a fine richiesta, anche
+//     con errore: il defer in Workflow.Invoke() è registrato prima di ogni
+//     return e RequestCompleted rilascia le prenotazioni prima di guardare
+//     l'esito. (d) Negli esperimenti più nodi di ingresso nella stessa zona;
+//     la condivisione delle prenotazioni tra nodi di origine NON si gestisce
+//     (richiederebbe coordinamento): sviluppo futuro. Da rivedere con la
+//     prof.ssa Cardellini.
 package workflow
 
 import (
@@ -499,6 +536,14 @@ type EnergyLessPolicy struct {
 	// altrimenti defaultCloudCores.
 	cloudCores float64
 
+	// [punto 28] planMu serializza la costruzione dei piani (primo piano e
+	// ripianificazioni): come lo scheduler unico, una richiesta alla volta
+	// legge lo stato e prenota le risorse. resMu protegge la tabella delle
+	// prenotazioni, letta anche da RequestCompleted.
+	planMu       sync.Mutex
+	resMu        sync.Mutex
+	reservations []elReservation
+
 	// Contatori delle richieste pianificate da questo nodo (punto 26),
 	// aggiornati da RequestCompleted; atomici perché le richieste terminano
 	// in goroutine diverse. Ripartono da zero a ogni avvio del nodo.
@@ -585,6 +630,7 @@ type elCandidate struct {
 	isLocal          bool
 	area             string
 	availMemMB       float64 // non usato per il candidato CLOUD, vedi estimateOnCandidate
+	statusTime       int64   // [punto 28] istante (Unix, s) dello stato letto: heartbeat del vicino, ora per il nodo locale
 	availCPU         float64 // idem — per CLOUD si assume capacità infinita (deciso 02/10)
 	co2Intensity     float64 // gCO2eq/kWh — ξ_i nel paper
 	procPowerW       float64 // W — τ_i nel paper: potenza sotto carico dell'intero nodo (consumption.processing.power)
@@ -692,6 +738,15 @@ func (policy *EnergyLessPolicy) evaluate(r *Request, p *Progress) ([]OffloadingD
 	}
 
 	placement, visited, ok := policy.getCachedPlan(r.Id)
+	if !ok || len(unvisitedReadyTasks(p, visited)) > 0 {
+		// [punto 28] Una pianificazione alla volta (vedi planMu): le
+		// richieste concorrenti aspettano qui, come in uno scheduler unico.
+		// La voce in cache di QUESTA richiesta non cambia mentre si aspetta,
+		// perché Evaluate gira sotto r.mu.
+		policy.planMu.Lock()
+		defer policy.planMu.Unlock()
+		policy.pruneReservations(time.Now())
+	}
 	if !ok {
 		candidates := policy.gatherCandidates()
 		if len(candidates) == 0 {
@@ -775,6 +830,9 @@ func variantChoices(w *Workflow, placement map[TaskId]*elEstimate) map[TaskId]st
 // da cicli).
 func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []elCandidate, residualDeadline float64, startTasks []TaskId, startAccuracy float64, known map[TaskId]bool, knownPlacement map[TaskId]*elEstimate) (map[TaskId]*elEstimate, map[TaskId]bool) {
 	placement := make(map[TaskId]*elEstimate)
+	// Istante di riferimento del piano: startAt e completionTime sono relativi
+	// a questo, le prenotazioni (punto 28) sono in tempo assoluto.
+	planTime := time.Now()
 
 	// Ranking dei task pronti (righe 6-12, Alg. 1): r_f = tempo medio
 	// stimato sulle istanze candidate. Dà l'ordine con cui si visitano i
@@ -925,8 +983,14 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 		outputs := viaOriginSources(inputsOf[tid])
 
 		if ft, isFunc := task.(*FunctionTask); isFunc {
-			if est := policy.placeFunctionTask(r, tid, ft, candidates, origin, inputsOf[tid], shipped, residualDeadline, startAt[tid], minAccuracy, accChain, &deadlineAtRisk); est != nil {
+			// [punto 28] Capacità di ogni candidato all'istante di inizio
+			// stimato del task: stato letto meno le prenotazioni attive in
+			// quell'istante (rami paralleli e altre richieste in corso).
+			taskStart := planTime.Add(time.Duration(startAt[tid] * float64(time.Second)))
+			taskCandidates := policy.candidatesAt(candidates, taskStart)
+			if est := policy.placeFunctionTask(r, tid, ft, taskCandidates, origin, inputsOf[tid], shipped, residualDeadline, startAt[tid], minAccuracy, accChain, &deadlineAtRisk); est != nil {
 				placement[tid] = est
+				policy.reserve(r.Id, tid, est, taskStart)
 				finish += est.completionTime.Seconds()
 				accChain *= est.accuracy
 				outputs = []elDataSource{{loc: est.candidate, bytes: outputBytes(est.functionName, ft.Func), producer: tid}}
@@ -958,6 +1022,7 @@ func (policy *EnergyLessPolicy) buildPlan(r *Request, p *Progress, candidates []
 	}
 
 	logPlan(r.Id, placement, makespan, residualDeadline)
+	log.Printf("EnergyLess: richiesta %s, prenotazioni attive dopo il piano: %s", r.Id, policy.reservationsSummary())
 	return placement, visited
 }
 
@@ -1166,6 +1231,146 @@ func (policy *EnergyLessPolicy) cacheSolution(requestId string, placement map[Ta
 	}
 }
 
+// ---------------------------------------------------------------------
+// Tabella delle risorse prenotate (punto 28).
+// ---------------------------------------------------------------------
+
+// elReservation è una prenotazione di risorse su un nodo edge per un task
+// pianificato: memoria e CPU della funzione scelta, nell'intervallo stimato
+// [start, end) in tempo assoluto.
+type elReservation struct {
+	requestId  string
+	task       TaskId
+	node       string
+	start, end time.Time
+	memMB, cpu float64
+}
+
+// reserve registra la prenotazione del task appena posizionato. Il cloud non
+// si prenota (capacità infinita, deciso il 02/10). Va chiamata con planMu.
+func (policy *EnergyLessPolicy) reserve(requestId string, tid TaskId, est *elEstimate, start time.Time) {
+	if est.candidate.key == "CLOUD" {
+		return
+	}
+	mem, cpu := 0.0, 1.0
+	if fn, ok := function.GetFunction(est.functionName); ok {
+		mem, cpu = float64(fn.MemoryMB), fn.CPUDemand
+	}
+	policy.resMu.Lock()
+	defer policy.resMu.Unlock()
+	policy.reservations = append(policy.reservations, elReservation{
+		requestId: requestId, task: tid, node: est.candidate.key,
+		start: start, end: start.Add(est.completionTime), memMB: mem, cpu: cpu,
+	})
+}
+
+// candidatesAt restituisce una copia dei candidati con memoria e CPU
+// disponibili all'istante at: stato letto meno le prenotazioni attive in
+// quell'istante (start <= at < end). Un task in catena parte quando finisce
+// il precedente, quindi non vede la prenotazione del precedente (riuso dello
+// stesso core); i rami paralleli e le richieste concorrenti invece si sommano.
+func (policy *EnergyLessPolicy) candidatesAt(candidates []elCandidate, at time.Time) []elCandidate {
+	policy.resMu.Lock()
+	defer policy.resMu.Unlock()
+	out := append([]elCandidate(nil), candidates...)
+	for i := range out {
+		if out[i].key == "CLOUD" {
+			continue
+		}
+		for _, res := range policy.reservations {
+			if res.node == out[i].key && !at.Before(res.start) && at.Before(res.end) {
+				out[i].availMemMB -= res.memMB
+				out[i].availCPU -= res.cpu
+			}
+		}
+	}
+	return out
+}
+
+// pruneReservations toglie le prenotazioni che lo stato dei nodi riflette già
+// o che non servono più: scadute (end <= now); sul nodo locale, già iniziate
+// (lo stato locale è letto in tempo reale dai container attivi); su un vicino,
+// iniziate prima del suo ultimo heartbeat (lo stato ricevuto le include, o il
+// task è già finito). Restano quelle future, che nessuno stato può ancora
+// mostrare. È il "reset a ogni heartbeat" deciso il 18/11, senza perdere le
+// prenotazioni non ancora visibili. Va chiamata con planMu.
+func (policy *EnergyLessPolicy) pruneReservations(now time.Time) {
+	local := ""
+	if registration.SelfRegistration != nil {
+		local = registration.SelfRegistration.Key
+	}
+	heartbeat := make(map[string]int64)
+	for key, status := range registration.GetFullNeighborInfo() {
+		if status != nil {
+			heartbeat[key] = status.LastUpdateTime
+		}
+	}
+	policy.resMu.Lock()
+	defer policy.resMu.Unlock()
+	kept := policy.reservations[:0]
+	for _, res := range policy.reservations {
+		switch {
+		case !res.end.After(now):
+		case res.node == local && !res.start.After(now):
+		case heartbeat[res.node] > 0 && res.start.Unix() <= heartbeat[res.node]:
+		default:
+			kept = append(kept, res)
+		}
+	}
+	policy.reservations = kept
+}
+
+// releaseReservations toglie tutte le prenotazioni di una richiesta terminata.
+func (policy *EnergyLessPolicy) releaseReservations(requestId string) {
+	policy.resMu.Lock()
+	defer policy.resMu.Unlock()
+	kept := policy.reservations[:0]
+	for _, res := range policy.reservations {
+		if res.requestId != requestId {
+			kept = append(kept, res)
+		}
+	}
+	policy.reservations = kept
+}
+
+// reservationsSummary riassume le prenotazioni per nodo, per il log: numero
+// di task prenotati e risorse prenotate ADESSO (prenotazioni attive in questo
+// istante; quelle future di una catena non si sommano).
+func (policy *EnergyLessPolicy) reservationsSummary() string {
+	policy.resMu.Lock()
+	defer policy.resMu.Unlock()
+	if len(policy.reservations) == 0 {
+		return "nessuna"
+	}
+	type agg struct {
+		n        int
+		mem, cpu float64
+	}
+	now := time.Now()
+	byNode := make(map[string]*agg)
+	var nodes []string
+	for _, res := range policy.reservations {
+		a, ok := byNode[res.node]
+		if !ok {
+			a = &agg{}
+			byNode[res.node] = a
+			nodes = append(nodes, res.node)
+		}
+		a.n++
+		if !now.Before(res.start) && now.Before(res.end) {
+			a.mem += res.memMB
+			a.cpu += res.cpu
+		}
+	}
+	sort.Strings(nodes)
+	parts := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		a := byNode[n]
+		parts = append(parts, fmt.Sprintf("%s: %d task prenotati, ora %.0f MB e %.1f CPU", n, a.n, a.mem, a.cpu))
+	}
+	return strings.Join(parts, "; ")
+}
+
 // Controllo a tempo di compilazione: la policy implementa l'interfaccia.
 var _ RequestCompletionListener = (*EnergyLessPolicy)(nil)
 
@@ -1189,6 +1394,7 @@ func (policy *EnergyLessPolicy) RequestCompleted(r *Request, err error) {
 	delete(policy.cache, r.Id)
 	remaining := len(policy.cache)
 	policy.cacheMu.Unlock()
+	policy.releaseReservations(r.Id) // [punto 28] la richiesta non occupa più risorse
 
 	respT := time.Since(r.Arrival).Seconds()
 	deadline := r.QoS.MaxRespT
@@ -1356,6 +1562,7 @@ func (policy *EnergyLessPolicy) gatherCandidates() []elCandidate {
 			isLocal:          true,
 			area:             local.Area,
 			availMemMB:       float64(node.LocalResources.AvailableMemory()),
+			statusTime:       time.Now().Unix(),
 			availCPU:         node.LocalResources.AvailableCPUs(),
 			co2Intensity:     node.LocalResources.CO2Intensity(),
 			procPowerW:       node.LocalResources.ProcessingPower(),
@@ -1383,6 +1590,7 @@ func (policy *EnergyLessPolicy) gatherCandidates() []elCandidate {
 			apiURL:           peer.APIUrl(),
 			area:             peer.Area,
 			availMemMB:       float64(status.AvailableMemory),
+			statusTime:       status.LastUpdateTime,
 			availCPU:         status.TotalCPU - status.UsedCPU,
 			co2Intensity:     status.CO2Intensity,
 			procPowerW:       status.ProcessingPowerConsumption,
